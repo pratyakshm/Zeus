@@ -2200,6 +2200,7 @@ impl Call {
                 handle: None,
                 media_ready: false,
                 mic: Some(mic),
+                mic_open: true,
                 speaker: Some(output),
                 camera_wanted: video_pipe
                     .as_ref()
