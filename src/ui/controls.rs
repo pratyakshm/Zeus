@@ -278,7 +278,9 @@ impl<'a> Field<'a> {
         }
         let response = child.add_enabled(enabled, edit);
         // The padding is part of the field: pressing it focuses the text.
-        if enabled && ui.interact(rect, id.with("pad"), Sense::click()).clicked() {
+        // `Sense::click()` is also a tab stop, so Tab would land on the
+        // padding and never reach the next field.
+        if enabled && ui.interact(rect, id.with("pad"), Sense::CLICK).clicked() {
             ui.memory_mut(|memory| memory.request_focus(response.id));
         }
         theme::focus_outline(ui, response.id, rect, HEIGHT / 2.0);

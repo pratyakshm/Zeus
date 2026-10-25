@@ -4423,23 +4423,23 @@ fn bubble(
     {
         swipe_to_reply(ui, view, message, start, rect, actions);
     }
-    if !view.selecting || view.selected.contains(&message.id) {
-        if let Some(rect) = rect {
-            let fill = if message.from_me {
-                view.palette.bubble_out
-            } else {
-                view.palette.bubble_in
-            };
-            super::carry::watch(
-                ui,
-                &view.chat.id,
-                album.unwrap_or(std::slice::from_ref(message)),
-                view.selected,
-                start,
-                rect,
-                fill,
-            );
-        }
+    if (!view.selecting || view.selected.contains(&message.id))
+        && let Some(rect) = rect
+    {
+        let fill = if message.from_me {
+            view.palette.bubble_out
+        } else {
+            view.palette.bubble_in
+        };
+        super::carry::watch(
+            ui,
+            &view.chat.id,
+            album.unwrap_or(std::slice::from_ref(message)),
+            view.selected,
+            start,
+            rect,
+            fill,
+        );
     }
     response
 }
@@ -6769,13 +6769,18 @@ fn footer_over_picture(
         + tick_width
         + marks;
     // A narrow picture (a tall sticker, a small photo) cannot hold the whole
-    // time and ticks, so the bubble widens until it can.
+    // time and ticks, so the bubble widens until it can. A picture that
+    // already can must not be measured out to its painted edge: that edge
+    // sits in the bubble's padding, and pulling the bubble out to it leaves
+    // one side with a wider rim.
     let needed = width + OVER_PICTURE_INSET.x * 2.0;
-    let picture = Rect::from_min_size(
-        picture.min,
-        vec2(picture.width().max(needed), picture.height()),
-    );
-    ui.expand_to_include_x(picture.right());
+    let picture = if picture.width() + 0.5 < needed {
+        let grown = Rect::from_min_size(picture.min, vec2(needed, picture.height()));
+        ui.expand_to_include_x(grown.right());
+        grown
+    } else {
+        picture
+    };
     let row = Rect::from_min_max(
         pos2(
             picture.right() - OVER_PICTURE_INSET.x - width,
@@ -7827,14 +7832,26 @@ fn context_menu(
     if has_message_info(message) {
         widgets::menu_separator(ui, &palette);
     }
-    if can_revoke && widgets::menu_item(ui, &palette, Some(Icon::Trash), "Delete for everyone") {
+    if can_revoke
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Trash),
+            &crate::i18n::gettext(view.locale, "Delete for everyone"),
+        )
+    {
         actions.push(Action::ShowDialog(Dialog::ConfirmDeleteMessage {
             chat: view.chat.id.clone(),
             message: message.id.clone(),
             for_everyone: true,
         }));
     }
-    if widgets::menu_item(ui, &palette, Some(Icon::EyeOff), "Delete for me") {
+    if widgets::menu_item(
+        ui,
+        &palette,
+        Some(Icon::EyeOff),
+        &crate::i18n::gettext(view.locale, "Delete for me"),
+    ) {
         actions.push(Action::ShowDialog(Dialog::ConfirmDeleteMessage {
             chat: view.chat.id.clone(),
             message: message.id.clone(),

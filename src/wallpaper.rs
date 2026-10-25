@@ -702,11 +702,22 @@ mod tests {
         let grey = ink(&look(1.5, None));
         let tinted = ink(&look(1.5, Some(accent)));
         assert_eq!(ink_alpha(tinted), ink_alpha(grey));
-        assert_eq!(tinted.to_srgba_unmultiplied()[..3], [0x20, 0x90, 0xf0]);
-        assert_ne!(
-            tinted.to_srgba_unmultiplied()[..3],
-            grey.to_srgba_unmultiplied()[..3]
+        // The painter is handed the accent at the grey ink's alpha. egui
+        // stores that premultiplied, so reading the bytes back can move a
+        // channel by a couple (here 144 and 240).
+        let alpha = ink_alpha(grey);
+        assert_eq!(
+            tinted,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), alpha)
         );
+        let got = tinted.to_srgba_unmultiplied();
+        for (channel, want) in got[..3].iter().zip([0x20_u8, 0x90, 0xf0]) {
+            assert!(
+                (*channel as i16 - i16::from(want)).unsigned_abs() <= 2,
+                "accent {want:#x} came back {channel}"
+            );
+        }
+        assert_ne!(got[..3], grey.to_srgba_unmultiplied()[..3]);
     }
 
     fn write_image(path: &Path, width: u32, height: u32) {

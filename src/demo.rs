@@ -15779,8 +15779,16 @@ mod tests {
         ];
         fn bars(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
             match shape {
-                egui::Shape::Rect(rect) if (rect.rect.width() - 4.0).abs() < 0.01 => {
+                // A straight bar, or the quote bar that follows the card's
+                // rounded corners. Both are four points wide.
+                egui::Shape::Rect(rect) if (rect.rect.width() - 4.0).abs() < 0.5 => {
                     out.push(rect.fill)
+                }
+                egui::Shape::Path(path) => {
+                    let bounds = egui::Rect::from_points(&path.points);
+                    if (bounds.width() - 4.0).abs() < 0.5 {
+                        out.push(path.fill);
+                    }
                 }
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| bars(shape, out)),
                 _ => {}
