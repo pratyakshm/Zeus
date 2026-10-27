@@ -408,8 +408,6 @@ pub struct App {
     theme_transition: fastframe_theme::Transition,
     /// A chat theme picked in Settings, opening from its card.
     theme_reveal: crate::theme_reveal::Reveal,
-    /// The Halloween ghost or candy on screen.
-    pub(crate) surprise: crate::surprise::Surprise,
     /// Whether palette changes are revealed. Off in tests, whose frames send
     /// no screenshots and would hold the old palette.
     pub reveal_theme_changes: bool,
@@ -744,8 +742,6 @@ pub struct App {
     pub settings_search: String,
     /// The settings category shown beside the list of them.
     pub settings_section: usize,
-    /// Whether Settings shows the Halloween page instead of the list.
-    pub settings_halloween: bool,
     pub focus_settings_search: bool,
     pub quit_requested: bool,
     pub window_focused: bool,
@@ -1382,7 +1378,6 @@ impl App {
             applied_dark: None,
             theme_transition: fastframe_theme::Transition::default(),
             theme_reveal: crate::theme_reveal::Reveal::default(),
-            surprise: crate::surprise::Surprise::default(),
             reveal_theme_changes: !cfg!(test),
             zoom_applied: false,
             wallpaper_image: crate::wallpaper::CustomImage::default(),
@@ -1541,7 +1536,6 @@ impl App {
             focus_search: false,
             settings_search: String::new(),
             settings_section: 0,
-            settings_halloween: false,
             focus_settings_search: false,
             quit_requested: false,
             window_focused: false,
@@ -1955,10 +1949,6 @@ impl App {
             // Messages draws its conversations on a plain background.
             doodles: self.settings.show_wallpaper
                 && self.palette.bubbles != crate::theme::BubbleStyle::Messages,
-            scene: self.settings.halloween_wallpaper()
-                && self.settings.wallpaper_color_for(self.palette.dark)
-                    == crate::settings::WallpaperColor::Theme
-                && self.account().settings.wallpaper_image.is_none(),
             style: self.settings.doodle_style,
             intensity: self.settings.doodle_intensity,
             accent: (self.settings.doodle_color == crate::settings::DoodleColor::Accent)
@@ -5786,31 +5776,6 @@ impl App {
     }
 
     /// Dispatches composed text with its explicit quote target and restores it on refusal.
-    /// Sometimes a ghost jumps out or candy falls when a message is sent, if
-    /// Halloween asks for it. Never during a call, while a screen reader is
-    /// attached, or from an account that is not on screen.
-    fn halloween_surprise(&mut self, ctx: &egui::Context) {
-        if self.call.is_some()
-            || self.events_hidden
-            || self.surprise.running()
-            || crate::motion::screen_reader_attached(ctx)
-        {
-            return;
-        }
-        let Some(kind) = crate::surprise::pick(
-            self.settings.halloween_ghost(),
-            self.settings.halloween_candies(),
-            rand::random::<f64>(),
-            rand::random::<f64>(),
-        ) else {
-            return;
-        };
-        self.surprise.start(ctx, kind);
-        if kind == crate::surprise::Kind::Ghost && self.settings.halloween_parts.sounds {
-            crate::notify::play_boo();
-        }
-    }
-
     fn send_text(
         &mut self,
         chat: ChatId,
@@ -6431,23 +6396,6 @@ impl App {
             }
         };
         crate::backdrop::set_blur(self.settings.blur);
-        let halloween = self.settings.halloween_icons();
-        if crate::theme::halloween() != halloween {
-            crate::theme::set_halloween(halloween);
-            // The window's picture changes with the look; macOS keeps the
-            // bundle's Dock icon.
-            #[cfg(not(target_os = "macos"))]
-            {
-                let icon = crate::util::app_icon_rgba(256);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(std::sync::Arc::new(
-                    egui::IconData {
-                        rgba: icon,
-                        width: 256,
-                        height: 256,
-                    },
-                ))));
-            }
-        }
         let palette = self.settings.palette(dark);
         if crate::theme::apply_text_rendering_change(ctx) {
             self.applied_dark = None;
@@ -6639,7 +6587,6 @@ impl App {
                     self.cancel_contact_dialog_request();
                 }
                 self.page = page;
-                self.settings_halloween = false;
                 self.dialog = None;
                 self.emoji_start = None;
                 self.mention_start = None;
@@ -6846,12 +6793,8 @@ impl App {
                 text,
                 quoting,
             } => {
-                let sent = !text.trim().is_empty();
                 self.send_text(chat, text, quoting);
                 self.reply_to = None;
-                if sent {
-                    self.halloween_surprise(ctx);
-                }
             }
             Action::SendLocation {
                 chat,
@@ -8634,10 +8577,6 @@ impl App {
                 self.settings_section = index;
                 self.settings_search.clear();
             }
-            Action::ShowHalloweenPage(open) => {
-                self.settings_halloween = open;
-                self.settings_search.clear();
-            }
             Action::RevealThemeFrom(origin) => self.theme_reveal.arm(origin),
             Action::SetStyle(style) => {
                 if self.settings.choose_style(style) {
@@ -8647,16 +8586,6 @@ impl App {
             }
             Action::SetMode(mode) => {
                 self.settings.mode = mode;
-                self.mark_settings_dirty();
-                self.apply_theme(ctx);
-            }
-            Action::SetHalloweenPart(part, on) => {
-                self.settings.set_halloween_part(part, on);
-                self.mark_settings_dirty();
-                self.apply_theme(ctx);
-            }
-            Action::SetHalloween(on) => {
-                self.settings.set_halloween(on);
                 self.mark_settings_dirty();
                 self.apply_theme(ctx);
             }
@@ -10285,7 +10214,6 @@ impl App {
         // The old colours, if a change is being revealed, go over everything.
         self.theme_transition.paint(ctx);
         self.theme_reveal.paint(ctx);
-        self.surprise.paint(ctx);
         // Release the image caches of everything that scrolled away.
         crate::image_cache::sweep(ctx);
         // Likewise the decoded frames of stickers and GIFs nothing draws now.

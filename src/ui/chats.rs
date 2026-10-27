@@ -948,7 +948,7 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
                 "Use New chat to message a contact or yourself.",
             )
         };
-        widgets::empty_state(ui, &palette, theme::chats_icon(), title, body);
+        widgets::empty_state(ui, &palette, Icon::MessageCircle, title, body);
         return;
     }
     // Rows touch: one clickable surface from top to bottom, no gaps or rules.
@@ -2302,14 +2302,10 @@ fn sound_menu(app: &mut App, ui: &mut egui::Ui, palette: &Palette, chat: &Chat) 
     let locale = app.locale;
     let current = chat.notification_sound.clone();
     let default_label = crate::i18n::gettext(locale, "Default");
-    let spooky_label = crate::i18n::gettext(locale, "Spooky");
-    let witching_label = crate::i18n::gettext(locale, "Witching hour");
     let system_label = crate::i18n::gettext(locale, "System sound");
     let none_label = crate::i18n::gettext(locale, "No sound");
     let sounds = [
         (None, default_label),
-        (Some(NotificationSound::Spooky), spooky_label),
-        (Some(NotificationSound::Witching), witching_label),
         (Some(NotificationSound::Receive), "Pidgin".into()),
         (Some(NotificationSound::Alert), "Pidgin alert".into()),
         (Some(NotificationSound::System), system_label),

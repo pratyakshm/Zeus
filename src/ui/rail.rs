@@ -365,7 +365,7 @@ fn destination_button(
     let mut badge = 0;
     let (icon, stop, label) = match destination {
         Destination::Chats => (
-            theme::chats_icon(),
+            Icon::MessageCircle,
             Stop::Chats,
             format!(
                 "{} ({})",
@@ -374,7 +374,7 @@ fn destination_button(
             ),
         ),
         Destination::Calls => (
-            theme::phone_icon(),
+            Icon::Phone,
             Stop::Calls,
             format!(
                 "{} ({})",
