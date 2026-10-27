@@ -325,7 +325,8 @@ fn stale(entries: &HashMap<String, Entry>, frame: u64, now: f64) -> Vec<String> 
     }
     idle.iter()
         .zip(gone)
-        .filter_map(|((uri, _), gone)| gone.then(|| (*uri).to_owned()))
+        .filter(|(_, gone)| *gone)
+        .map(|((uri, _), _)| (*uri).to_owned())
         .collect()
 }
 
