@@ -13,7 +13,6 @@ mod loader;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 /// Image URIs kept resident. Anything the current frame drew is always kept,
 /// so this only bounds what has scrolled away.
@@ -27,10 +26,6 @@ const BUDGET: usize = 64 * 1024 * 1024;
 /// minute finds it loaded, and later it loads again as an image never shown
 /// does.
 const IDLE_SECONDS: f64 = 60.0;
-
-/// The shortest wait for a frame that only releases images, so pictures that
-/// scrolled away moments apart go in one frame rather than one frame each.
-const WAKE_GAP: Duration = Duration::from_secs(5);
 
 /// Full-size pictures the open preview keeps besides the one it shows, so
 /// stepping back to the previous one is instant.
@@ -240,28 +235,21 @@ pub fn forget(ctx: &egui::Context, uri: &str) {
 /// window.
 ///
 /// Images the current frame drew are never forgotten, so a frame that shows
-/// more than the window holds does not reload them on the next one. When
-/// images that are not on screen remain, a frame is asked for when the next
-/// of them is due, so a window left idle lets them go too; one whose images
-/// are all on screen asks for nothing.
+/// more than the window holds does not reload them on the next one. It never
+/// asks for a frame: images not on screen go on the next frame that runs.
 pub fn sweep(ctx: &egui::Context) {
     let (frame, now) = moment(ctx);
-    let (stale, wake) = {
+    let stale = {
         let registry = registry(ctx);
         let mut entries = registry.0.lock().unwrap_or_else(|p| p.into_inner());
         let stale = stale(&entries, frame, now);
         for uri in &stale {
             entries.remove(uri);
         }
-        (stale, wake(&entries, frame, now))
+        stale
     };
     for uri in stale {
         ctx.forget_image(&uri);
-    }
-    match wake {
-        Some(after) if after.is_zero() => ctx.request_repaint(),
-        Some(after) => ctx.request_repaint_after(after),
-        None => {}
     }
 }
 
@@ -328,29 +316,6 @@ fn stale(entries: &HashMap<String, Entry>, frame: u64, now: f64) -> Vec<String> 
         .filter(|(_, gone)| *gone)
         .map(|((uri, _), _)| (*uri).to_owned())
         .collect()
-}
-
-/// How soon a frame has to run for a later sweep to release what is not on
-/// screen while nothing else draws: at once for a full-size picture the
-/// closed preview left, otherwise when the image left undrawn longest has
-/// idled long enough, but not sooner than `WAKE_GAP`. `None` when every image
-/// left was drawn this frame.
-fn wake(entries: &HashMap<String, Entry>, frame: u64, now: f64) -> Option<Duration> {
-    let previewing = previewing(entries, frame);
-    let mut soonest: Option<f64> = None;
-    for (uri, entry) in entries.iter().filter(|(_, entry)| entry.frame < frame) {
-        if !previewing && is_full_size(uri) {
-            return Some(Duration::ZERO);
-        }
-        let due = entry.seen + IDLE_SECONDS - now;
-        let due = if due.is_finite() {
-            due.clamp(0.0, IDLE_SECONDS)
-        } else {
-            0.0
-        };
-        soonest = Some(soonest.map_or(due, |soonest| soonest.min(due)));
-    }
-    soonest.map(|due| Duration::from_secs_f64(due).max(WAKE_GAP))
 }
 
 #[cfg(test)]
@@ -808,26 +773,9 @@ mod tests {
         ]);
         // Open: it keeps the picture shown a step ago, not the one before.
         assert_eq!(stale(&entries, 10, 0.0), vec![older.clone()]);
-        assert_eq!(wake(&entries, 10, 0.0), Some(Duration::from_secs(60)));
         entries.remove(&older);
-        // Closed: a frame's grace, then both go, and the window asks for the
-        // frame that releases them.
+        // Closed: a frame's grace, then both go.
         assert_eq!(stale(&entries, 11, 0.0), vec![previous.clone()]);
-        assert_eq!(wake(&entries, 11, 0.0), Some(Duration::ZERO));
         assert_eq!(stale(&entries, 12, 0.0), vec![previous, shown]);
-    }
-
-    #[test]
-    fn an_idle_window_asks_for_a_frame_only_for_what_is_off_screen() {
-        let mut entries = HashMap::from([(uri(1), entry(10, 100.0, 1))]);
-        assert_eq!(wake(&entries, 10, 100.0), None, "everything is on screen");
-        entries.insert(uri(2), entry(9, 95.0, 1));
-        assert_eq!(wake(&entries, 10, 100.0), Some(Duration::from_secs(55)));
-        entries.insert(uri(3), entry(9, 41.0, 1));
-        assert_eq!(
-            wake(&entries, 10, 100.0),
-            Some(WAKE_GAP),
-            "nearly due, it waits a moment for others"
-        );
     }
 }
