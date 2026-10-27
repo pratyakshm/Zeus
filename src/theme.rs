@@ -873,6 +873,9 @@ fn tabular_family(weight: fastframe_fonts::Weight) -> egui::FontFamily {
 pub fn install(ctx: &egui::Context) {
     install_fonts(ctx);
     egui_extras::install_image_loaders(ctx);
+    // Asked before egui_extras' loaders: still pictures are decoded at the
+    // size they are drawn at rather than at the file's.
+    crate::image_cache::install(ctx);
     // Served by a loader that never forgets them, so `reduce_texture_memory`
     // below cannot leave an icon drawn at two sizes without bytes.
     fastframe_icons::install::<Icon>(ctx);
@@ -880,7 +883,8 @@ pub fn install(ctx: &egui::Context) {
     fastframe_titlebar::install(ctx);
     // Drop the raw bytes and the decoded pixels once a texture is on the GPU.
     // egui keeps all three copies of every image otherwise, and only ever
-    // evicts the textures of SVGs.
+    // evicts the textures of SVGs. `image_cache`'s loader does the same for
+    // the pictures it decodes.
     ctx.options_mut(|options| options.reduce_texture_memory = true);
 }
 

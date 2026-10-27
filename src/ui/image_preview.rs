@@ -547,8 +547,9 @@ fn still(
         return None;
     };
     // Registered with the image cache like every other draw site, so a sweep
-    // never releases the picture while it is on screen.
-    let image = crate::ui::widgets::file_image(ui, path);
+    // never releases the picture while it is on screen. Its own full-size
+    // texture, so zooming in shows every pixel and the bubble's stays small.
+    let image = crate::ui::widgets::full_size_file_image(ui, path);
     match image.load_for_size(ui.ctx(), canvas) {
         Ok(egui::load::TexturePoll::Ready { texture }) => {
             let size = display_size(texture.size, canvas, preview.is_fit(), preview.zoom());

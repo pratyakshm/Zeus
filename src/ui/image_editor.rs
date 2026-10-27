@@ -61,7 +61,14 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Rect::from_min_max(pos2(room.min.x, top.max.y), pos2(room.max.x, bottom.min.y));
             let picture = fitted(vec2(wide as f32, tall as f32), inner);
             let scale = picture.width() / wide.max(1) as f32;
-            if let Some(id) = texture(ui, &source, pasted.as_ref(), picture.size()) {
+            // The texture is drawn turned: a quarter turn lays its width
+            // along the picture's height, and it is asked for at that size.
+            let unturned = if edit.turns.is_multiple_of(2) {
+                picture.size()
+            } else {
+                vec2(picture.height(), picture.width())
+            };
+            if let Some(id) = texture(ui, &source, pasted.as_ref(), unturned) {
                 paint_turned(ui, id, picture, edit.turns);
             }
             // The region is kept in the picture's pixels, so a drag is turned

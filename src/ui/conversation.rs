@@ -10890,7 +10890,12 @@ fn video_note(
         let poster = || {
             let bytes = message.thumbnail.as_deref()?;
             let uri = thumbnail_uri(ui.ctx(), &message.chat, &message.id, bytes);
-            match egui::Image::new(uri).load_for_size(ui.ctx(), picture.size()) {
+            // Cropped to the circle below, so asked for at the size that
+            // covers it.
+            match egui::Image::new(uri)
+                .maintain_aspect_ratio(false)
+                .load_for_size(ui.ctx(), picture.size())
+            {
                 Ok(egui::load::TexturePoll::Ready { texture }) => Some((texture.id, texture.size)),
                 _ => None,
             }
@@ -11820,6 +11825,20 @@ fn upload_picture(
     let (bubble, eased) =
         upload_bubble(ui, palette, picture_size + Vec2::splat(margin * 2.0), eased);
     let picture = bubble.shrink(margin);
+    // The texture is decoded at the size it is asked for. The cover crop
+    // below can need more of it than the square asked for above (a portrait
+    // photo's frame is cut down to 320 points), so it is asked for the frame.
+    let texture = match preview {
+        crate::model::UploadPreview::File(path) if texture.is_some() => {
+            widgets::file_image(ui, path)
+                .maintain_aspect_ratio(false)
+                .load_for_size(ui.ctx(), picture.size())
+                .ok()
+                .and_then(|poll| poll.texture_id())
+                .or(texture)
+        }
+        _ => texture,
+    };
     let radius = if palette.bubbles == theme::BubbleStyle::Nothing {
         12.0
     } else {

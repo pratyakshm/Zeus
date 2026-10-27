@@ -305,6 +305,15 @@ pub fn file_image(ui: &Ui, path: &Path) -> egui::Image<'static> {
     egui::Image::new(uri)
 }
 
+/// [`file_image`] with a texture of the file's own, at its full resolution,
+/// for the image preview: the picture's message keeps its smaller one. Until
+/// the full one is decoded the preview is shown the message's.
+pub fn full_size_file_image(ui: &Ui, path: &Path) -> egui::Image<'static> {
+    let uri = crate::image_cache::full_size_uri(&crate::util::image_uri(path));
+    crate::image_cache::touch(ui.ctx(), &uri);
+    egui::Image::new(uri)
+}
+
 /// Round profile picture, or id-colored initials when no picture is available.
 pub fn avatar(
     ui: &mut Ui,

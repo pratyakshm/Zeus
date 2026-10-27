@@ -384,6 +384,13 @@ protocol. These notes are for coding agents and new contributors.
   `widgets::line` / `widgets::rich_text` or `markup::layout`: their
   placeholders keep the emoji-only sizing and let `transcript::refine`
   put copied emoji back.
+- `src/image_cache.rs` installs loaders (`image_cache/loader.rs`) that decode
+  still pictures at the size they are drawn at (hint x pixels_per_point, on a
+  square-root-of-two ladder, never above the source); a texture grows on a
+  bigger draw and never shrinks. The image preview asks for `full_size_uri`.
+  Pictures not drawn for 60 s, or beyond 96 URIs or 64 MiB off screen, are
+  forgotten; while off-screen pictures remain, `sweep` asks for one repaint
+  when the next is due (at least 5 s apart), never a steady timer.
 - `src/animation.rs` plays animated stickers and GIFs: WebP/GIF frames
   decode in-process, and so do MP4s (the `mp4` crate demuxes, `openh264`
   decodes the H.264 WhatsApp uses, samples converted from AVCC to Annex
