@@ -829,32 +829,39 @@ impl FrostedPopup for egui::Popup<'_> {
             egui::LayerId::new(egui::Order::Foreground, id),
             theme::RADIUS_MENU,
         );
-        let appear = ctx.animate_bool_with_time_and_easing(
-            id.with("appear"),
-            true,
-            theme::POPUP_OPEN,
-            egui::emath::easing::quadratic_out,
-        );
+        // Animated only while open. A closed popup that asked would start the
+        // opening, and with it a frame, on every frame, and its reset below
+        // would take it back each time, so the window never went idle.
         let shown = self.show(|ui| {
+            let appear = ctx.animate_bool_with_time_and_easing(
+                id.with("appear"),
+                true,
+                theme::POPUP_OPEN,
+                egui::emath::easing::quadratic_out,
+            );
             ui.multiply_opacity(appear);
-            add(ui)
+            (appear, add(ui))
         });
-        let Some(shown) = shown else {
+        let Some(egui::InnerResponse {
+            inner: (appear, inner),
+            response,
+        }) = shown
+        else {
             // Closed: the next opening starts from the beginning.
             ctx.animate_bool_with_time(id.with("appear"), false, 0.0);
             return None;
         };
         if measured {
-            frost.place(shown.response.rect);
+            frost.place(response.rect);
             // Grows from the corner it opened at, glass and all.
             let scale = POPUP_FROM_SCALE + (1.0 - POPUP_FROM_SCALE) * appear;
-            let pivot = shown.response.rect.left_top().to_vec2();
+            let pivot = response.rect.left_top().to_vec2();
             ctx.transform_layer_shapes(
                 egui::LayerId::new(egui::Order::Foreground, id),
                 egui::emath::TSTransform::new(pivot * (1.0 - scale), scale),
             );
         }
-        Some(shown)
+        Some(egui::InnerResponse::new(inner, response))
     }
 }
 
