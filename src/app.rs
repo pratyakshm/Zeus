@@ -1928,6 +1928,7 @@ impl App {
             self.search.clear();
             self.search_hits.clear();
         }
+        self.trim_open_conversations();
         self.window_hidden = true;
         self.window_focused = false;
         self.hide_intent = false;
@@ -2990,22 +2991,32 @@ impl App {
     /// phone's order below pins instead of promoting drafts.
     /// Locked chats only appear inside the locked folder.
     pub fn visible_chats(&self) -> Vec<&Chat> {
+        self.visible_chat_indices()
+            .into_iter()
+            .map(|index| &self.chats[index])
+            .collect()
+    }
+
+    /// `visible_chats` as positions in `chats`, so a list can copy just the
+    /// rows it draws instead of every chat each frame.
+    pub fn visible_chat_indices(&self) -> Vec<usize> {
         let needle = crate::util::search_key(self.search.trim());
         let locked = self.locked_folder_open();
         let filtering = !locked && needle.is_empty() && !self.show_archived;
-        let mut chats: Vec<&Chat> = self
+        let mut indices: Vec<usize> = self
             .chats
             .iter()
-            .filter(|chat| chat.locked == locked)
-            .filter(|chat| locked || chat.archived == self.show_archived || !needle.is_empty())
+            .enumerate()
+            .filter(|(_, chat)| chat.locked == locked)
+            .filter(|(_, chat)| locked || chat.archived == self.show_archived || !needle.is_empty())
             // Searching still finds people never written to, and one being
             // opened stays.
-            .filter(|chat| {
+            .filter(|(_, chat)| {
                 !needle.is_empty()
                     || self.open_chat.as_deref() == Some(chat.id.as_str())
                     || !self.unlisted_stranger(chat)
             })
-            .filter(|chat| match &self.label_filter {
+            .filter(|(_, chat)| match &self.label_filter {
                 // A label lists every chat wearing it, channels included,
                 // because someone put each of them there.
                 _ if !filtering => true,
@@ -3016,7 +3027,7 @@ impl App {
                             && self.unread_kept.contains(&chat.id))
                 }
             })
-            .filter(|chat| {
+            .filter(|(_, chat)| {
                 // Inside the locked folder the typed text is the secret code,
                 // not a query to match.
                 (self.locked_folder && !self.chat_lock_authenticated())
@@ -3027,10 +3038,12 @@ impl App {
                         crate::util::search_key(&last.summary).contains(&needle)
                     })
             })
+            .map(|(index, _)| index)
             .collect();
         // The Favorites chip keeps the phone's order below the pinned chats.
         let favorites_order = self.favorites_order();
-        chats.sort_by(|a, b| {
+        indices.sort_by(|&a, &b| {
+            let (a, b) = (&self.chats[a], &self.chats[b]);
             b.pinned.cmp(&a.pinned).then_with(|| {
                 if a.pinned && b.pinned {
                     b.pinned_at.cmp(&a.pinned_at).then(a.id.cmp(&b.id))
@@ -3046,7 +3059,7 @@ impl App {
                 }
             })
         });
-        chats
+        indices
     }
 
     /// When a chat counts as last active for the list order: a chat holding a

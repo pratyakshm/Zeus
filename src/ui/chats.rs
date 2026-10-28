@@ -921,7 +921,8 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
         results(app, ui);
         return;
     }
-    let chats: Vec<Chat> = app.visible_chats().into_iter().cloned().collect();
+    // Positions only: the rows drawn below copy their own chat.
+    let chats = app.visible_chat_indices();
     if chats.is_empty() {
         // The favorites title is translated, so it is bound here: the tuple
         // below borrows it for this frame, and every other arm stays a literal.
@@ -961,10 +962,11 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
     if to_top && near_top(ui, "chat-list", row_height) {
         scroll_area = scroll_area.vertical_scroll_offset(0.0);
     }
-    let target_row = app
-        .scroll_chat_into_view
-        .as_ref()
-        .and_then(|target| chats.iter().position(|chat| chat.id == *target));
+    let target_row = app.scroll_chat_into_view.as_ref().and_then(|target| {
+        chats
+            .iter()
+            .position(|&index| app.chats[index].id == *target)
+    });
     // The copies a narrow window's slide draws have widget ids of their own:
     // they show the real list's offset instead of keeping one.
     let copy = ui
@@ -1010,10 +1012,12 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
             );
         }
         for index in range {
-            let chat = &chats[index];
+            let Some(chat) = app.chats.get(chats[index]).cloned() else {
+                continue;
+            };
             // Key by chat so an open menu survives list reordering.
             let response = ui
-                .push_id(("chat", &chat.id), |ui| row(app, ui, chat))
+                .push_id(("chat", &chat.id), |ui| row(app, ui, &chat))
                 .inner;
             // Store the row rect for interaction tests.
             ui.ctx()
@@ -1114,7 +1118,7 @@ fn locked_entry(app: &mut App, ui: &mut egui::Ui) {
 /// The authenticated folder, including archived chats and local title search.
 fn locked_list(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    let chats = app.visible_chats();
+    let chats = app.visible_chat_indices();
     if chats.is_empty() {
         widgets::empty_state(
             ui,
@@ -1125,15 +1129,15 @@ fn locked_list(app: &mut App, ui: &mut egui::Ui) {
         );
         return;
     }
-    let chats: Vec<Chat> = chats.into_iter().cloned().collect();
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut scroll_area = egui::ScrollArea::vertical()
         .id_salt("locked-chats")
         .auto_shrink([false, false]);
-    let target_row = app
-        .scroll_chat_into_view
-        .as_ref()
-        .and_then(|target| chats.iter().position(|chat| chat.id == *target));
+    let target_row = app.scroll_chat_into_view.as_ref().and_then(|target| {
+        chats
+            .iter()
+            .position(|&index| app.chats[index].id == *target)
+    });
     if let Some(target_row) = target_row {
         let id = ui.make_persistent_id(egui::IdSalt::new("locked-chats"));
         let current = egui::scroll_area::State::load(ui.ctx(), id)
@@ -1151,8 +1155,11 @@ fn locked_list(app: &mut App, ui: &mut egui::Ui) {
         app.scroll_chat_into_view = None;
     }
     scroll_area.show_rows(ui, theme::ROW_HEIGHT, chats.len(), |ui, range| {
-        for chat in &chats[range] {
-            ui.push_id(("chat", &chat.id), |ui| row(app, ui, chat));
+        for &index in &chats[range] {
+            let Some(chat) = app.chats.get(index).cloned() else {
+                continue;
+            };
+            ui.push_id(("chat", &chat.id), |ui| row(app, ui, &chat));
         }
     });
 }
@@ -1179,16 +1186,18 @@ fn row_scroll_offset(
 /// Search results grouped into chats, messages, and contacts.
 fn results(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    let chats: Vec<Chat> = app.visible_chats().into_iter().cloned().collect();
-    let hits: Vec<Message> = app.search_hits.clone();
+    // Chats and hits are positions: each row copies its own while it draws,
+    // so no frame holds a second copy of every result.
+    let chats = app.visible_chat_indices();
+    let hits = app.search_hits.len();
     let contacts: Vec<Contact> = app.matching_contacts().into_iter().cloned().collect();
     let needle = crate::util::search_key(app.search.trim());
     let offer_self = !needle.is_empty()
         && app.offers_self(&needle)
         && !chats
             .iter()
-            .any(|chat| app.me.as_deref() == Some(chat.id.as_str()));
-    if chats.is_empty() && hits.is_empty() && contacts.is_empty() && !offer_self {
+            .any(|&index| app.me.as_deref() == Some(app.chats[index].id.as_str()));
+    if chats.is_empty() && hits == 0 && contacts.is_empty() && !offer_self {
         widgets::empty_state(
             ui,
             &palette,
@@ -1205,11 +1214,14 @@ fn results(app: &mut App, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             if !chats.is_empty() {
                 section(ui, &palette, "Chats");
-                for chat in &chats {
+                for &index in &chats {
+                    let Some(chat) = app.chats.get(index).cloned() else {
+                        continue;
+                    };
                     let reveal = ui.is_enabled()
                         && app.scroll_chat_into_view.as_deref() == Some(chat.id.as_str());
                     let response = ui
-                        .push_id(("chat", &chat.id), |ui| row(app, ui, chat))
+                        .push_id(("chat", &chat.id), |ui| row(app, ui, &chat))
                         .inner;
                     if reveal {
                         response.scroll_to_me(None);
@@ -1217,10 +1229,13 @@ fn results(app: &mut App, ui: &mut egui::Ui) {
                     }
                 }
             }
-            if !hits.is_empty() {
+            if hits > 0 {
                 section(ui, &palette, "Messages");
-                for hit in &hits {
-                    ui.push_id(("hit", &hit.chat, &hit.id), |ui| hit_row(app, ui, hit));
+                for index in 0..hits {
+                    let Some(hit) = app.search_hits.get(index).cloned() else {
+                        continue;
+                    };
+                    ui.push_id(("hit", &hit.chat, &hit.id), |ui| hit_row(app, ui, &hit));
                 }
             }
             if !contacts.is_empty() || offer_self {
@@ -1889,7 +1904,7 @@ pub(super) fn compact_list(app: &mut App, ui: &mut egui::Ui) {
         compact_locked_entry(app, ui);
         return;
     }
-    let chats: Vec<Chat> = app.visible_chats().into_iter().cloned().collect();
+    let chats = app.visible_chat_indices();
     // Exactly the height the rail gives it: egui's least scrolled height
     // would reach past the window's bottom in a short one.
     let mut scroll_area = egui::ScrollArea::vertical()
@@ -1911,7 +1926,11 @@ pub(super) fn compact_list(app: &mut App, ui: &mut egui::Ui) {
         .scroll_chat_into_view
         .as_ref()
         .filter(|_| !copy)
-        .and_then(|target| chats.iter().position(|chat| chat.id == *target));
+        .and_then(|target| {
+            chats
+                .iter()
+                .position(|&index| app.chats[index].id == *target)
+        });
     if let Some(target_row) = target_row {
         let id = ui.make_persistent_id(egui::IdSalt::new("chat-rail"));
         let current = egui::scroll_area::State::load(ui.ctx(), id)
@@ -1943,9 +1962,12 @@ pub(super) fn compact_list(app: &mut App, ui: &mut egui::Ui) {
                 egui::style::ScrollAnimation::none(),
             );
         }
-        for chat in &chats[range] {
+        for &index in &chats[range] {
+            let Some(chat) = app.chats.get(index).cloned() else {
+                continue;
+            };
             let response = ui
-                .push_id(("chat", &chat.id), |ui| compact_row(app, ui, chat))
+                .push_id(("chat", &chat.id), |ui| compact_row(app, ui, &chat))
                 .inner;
             if response.clicked() && !app.locked_folder_open() && !app.show_archived {
                 app.actions.push(Action::KeepUnread(chat.id.clone()));
