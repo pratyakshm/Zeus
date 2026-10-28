@@ -7644,6 +7644,8 @@ impl App {
                 }
             }
             Action::ApplyPictureEdit => {
+                // The editor is closing, and its picture goes with it.
+                self.picture_texture = None;
                 if let Some(edit) = self.picture_edit.take() {
                     // Held against the attachment until the file lands, so a
                     // second edit started meanwhile cannot take its origin.
@@ -7669,6 +7671,7 @@ impl App {
             }
             Action::CancelPictureEdit => {
                 self.picture_edit = None;
+                self.picture_texture = None;
                 self.picture_inspecting = None;
             }
             Action::ClearPending => {
