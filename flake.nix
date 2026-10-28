@@ -109,8 +109,10 @@
             libxi
             libxrandr
           ];
-          zapfast = rustPlatform.buildRustPackage rec {
-            pname = "zapfast";
+          # This fork builds Zeus (src/brand.rs): its binary, launcher, icon
+          # and app bundle are named zeus, beside ZapFast's own.
+          zeus = rustPlatform.buildRustPackage rec {
+            pname = "zeus";
             version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
             src = self;
 
@@ -163,7 +165,7 @@
               # The GUI dlopens its Wayland, X11 and GL libraries at run time.
               pkgs.lib.optionalString isLinux ''
                 find $out/bin -type f -exec remove-references-to -t ${pkgs.stdenv.cc} {} +
-                wrapProgram $out/bin/zapfast \
+                wrapProgram $out/bin/zeus \
                   --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath runtimeLibs}
               ''
               # Sign after the strip hook, which would invalidate the signature.
@@ -171,42 +173,51 @@
               + pkgs.lib.optionalString isDarwin ''
                 rcodesign sign \
                   --entitlements-xml-file packaging/macos/entitlements.plist \
-                  $out/Applications/ZapFast.app
+                  $out/Applications/Zeus.app
               '';
 
             postInstall =
               pkgs.lib.optionalString isLinux ''
-                install -Dm644 packaging/applications/zapfast.desktop \
-                  $out/share/applications/zapfast.desktop
-                install -Dm644 packaging/icons/zapfast.svg \
-                  $out/share/icons/hicolor/scalable/apps/zapfast.svg
+                install -Dm644 packaging/applications/zeus.desktop \
+                  $out/share/applications/zeus.desktop
+                install -Dm644 packaging/icons/zeus.svg \
+                  $out/share/icons/hicolor/scalable/apps/zeus.svg
                 install -Dm644 contrib/omarchy/zapfast.json.tpl \
                   $out/share/zapfast/omarchy/zapfast.json.tpl
                 install -Dm755 contrib/omarchy/zapfast-theme \
                   $out/share/zapfast/omarchy/zapfast-theme
               ''
-              # Mirrors packaging/macos/bundle.sh: ZapFast.app around the built
-              # binary, with the version stripped of any prerelease suffix.
+              # Mirrors packaging/macos/bundle-zeus.sh: Zeus.app around the
+              # built binary, with the version stripped of any prerelease suffix.
               + pkgs.lib.optionalString isDarwin ''
-                app=$out/Applications/ZapFast.app
-                mkdir -p $app/Contents/MacOS $app/Contents/Resources
-                mv $out/bin/zapfast $app/Contents/MacOS/zapfast
-                chmod 755 $app/Contents/MacOS/zapfast
+                app=$out/Applications/Zeus.app
+                mkdir -p $app/Contents/MacOS $app/Contents/Resources \
+                  $app/Contents/Library/LaunchAgents
+                mv $out/bin/zeus $app/Contents/MacOS/zeus
+                chmod 755 $app/Contents/MacOS/zeus
                 # The command runs the bundled executable, so macOS applies the
                 # bundle's Info.plist and entitlements, and start at login
                 # records the bundled path.
-                makeWrapper $app/Contents/MacOS/zapfast $out/bin/zapfast
-                sed "s/__VERSION__/''${version%%-*}/g" packaging/macos/Info.plist \
+                makeWrapper $app/Contents/MacOS/zeus $out/bin/zeus
+                sed "s/__VERSION__/''${version%%-*}/g" packaging/macos/Info-zeus.plist \
                   > $app/Contents/Info.plist
-                icnsify packaging/macos/icon-1024.png \
-                  --output $app/Contents/Resources/zapfast.icns
+                install -Dm644 packaging/macos/autostart-zeus.plist \
+                  $app/Contents/Library/LaunchAgents/app.zeus.Zeus.autostart.plist
+                icnsify packaging/icons/zeus-1024.png \
+                  --output $app/Contents/Resources/zeus.icns
+                # Notification sounds are played from the bundle by these
+                # names (src/notify.rs).
+                install -Dm644 assets/sounds/receive.wav \
+                  $app/Contents/Resources/zapfast-receive.wav
+                install -Dm644 assets/sounds/alert.wav \
+                  $app/Contents/Resources/zapfast-alert.wav
               '';
 
             meta = {
               description = "Fast native WhatsApp client";
               homepage = "https://zapfast.rocks";
               license = with pkgs.lib.licenses; [ mit gpl2Only ];
-              mainProgram = "zapfast";
+              mainProgram = "zeus";
               # The flake publishes only aarch64-darwin. Older nixpkgs, for
               # example through follows, still list x86_64-darwin.
               platforms = pkgs.lib.platforms.linux ++ [ "aarch64-darwin" ];
@@ -214,8 +225,8 @@
           };
         in
         {
-          default = zapfast;
-          inherit zapfast;
+          default = zeus;
+          inherit zeus;
         }
       );
 
