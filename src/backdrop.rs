@@ -14,9 +14,14 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static BLUR: AtomicBool = AtomicBool::new(true);
 
 /// Whether glass is frosted, as Settings' Blur says. Off, the frosted header
-/// and composer, glass and window material give way to solid surfaces.
+/// and composer and the glass give way to solid surfaces.
+///
+/// Never on macOS: it draws with Metal through egui-wgpu, which paints a
+/// frame in one render pass that a paint callback cannot read back, and the
+/// frost (`ui/glass.rs`) blurs what is already drawn. The window's material
+/// still follows Settings' Blur there (`Settings::vibrant_window`).
 pub fn blur() -> bool {
-    BLUR.load(Ordering::Relaxed)
+    !cfg!(target_os = "macos") && BLUR.load(Ordering::Relaxed)
 }
 
 /// Records Settings' Blur for [`blur`]; the app does so every frame.

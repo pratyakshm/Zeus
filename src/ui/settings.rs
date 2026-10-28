@@ -534,7 +534,11 @@ fn sections(app: &App) -> Vec<Section> {
         translated(locale, "Blur"),
         translated(
             locale,
-            "Frosted glass under the chat header and the message field, and the desktop through the window where the system allows. Off keeps every surface solid.",
+            if cfg!(target_os = "macos") {
+                "The desktop through the Messages theme's window. The chat header and the message field are solid on macOS. Off keeps the window solid too."
+            } else {
+                "Frosted glass under the chat header and the message field, and the desktop through the window where the system allows. Off keeps every surface solid."
+            },
         ),
         |settings| &mut settings.blur,
     );
