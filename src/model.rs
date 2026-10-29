@@ -45,6 +45,8 @@ pub enum UploadKind {
     Video,
     Audio,
     Document,
+    /// A sticker, which flies in from the picker and waits in place.
+    Sticker,
 }
 
 impl UploadKind {
@@ -731,6 +733,10 @@ pub struct ChatLink {
     pub url: String,
     /// The preview's title, when WhatsApp attached one for this address.
     pub title: Option<String>,
+    /// The preview's description, when it has one.
+    pub description: Option<String>,
+    /// The preview's picture as WhatsApp sent it, when it sent one.
+    pub thumbnail: Option<Vec<u8>>,
 }
 
 /// How many pictures and videos, documents, and links the info panel lists
@@ -767,12 +773,23 @@ impl ChatMedia {
                 Content::Image { .. } | Content::Video { .. } => media.media.push(row),
                 Content::Document { .. } => media.docs.push(row),
                 Content::Text { .. } => {
-                    for (url, title) in row.content.web_links() {
+                    let preview = match &row.content {
+                        Content::Text { preview, .. } => preview.as_ref(),
+                        _ => None,
+                    };
+                    for (index, (url, title)) in row.content.web_links().into_iter().enumerate() {
+                        // The preview's address comes first.
+                        let own = index == 0 && preview.is_some();
                         media.links.push(ChatLink {
                             message: row.id.clone(),
                             timestamp: row.timestamp,
                             url,
                             title,
+                            description: preview
+                                .filter(|_| own)
+                                .and_then(|preview| preview.description.clone())
+                                .filter(|text| !text.trim().is_empty()),
+                            thumbnail: row.thumbnail.clone().filter(|_| own),
                         });
                     }
                 }
@@ -1570,8 +1587,13 @@ impl Content {
     /// carousel card's picture. Files elsewhere, such as a chosen download
     /// folder, are kept.
     pub fn forget_files_in(&mut self, dir: &std::path::Path) {
+        self.forget_files(&|path| path.starts_with(dir));
+    }
+
+    /// Forgets the files `gone` picks, as [`Self::forget_files_in`] does.
+    pub fn forget_files(&mut self, gone: &dyn Fn(&std::path::Path) -> bool) {
         let forget = |path: &mut Option<PathBuf>, state: &mut MediaState| {
-            if path.as_deref().is_some_and(|path| path.starts_with(dir)) {
+            if path.as_deref().is_some_and(gone) {
                 *path = None;
                 *state = MediaState::Idle;
             }
@@ -2626,6 +2648,9 @@ pub struct Toast {
     pub created: Instant,
     /// What its Undo button does; empty when it has none.
     pub undo: Vec<Action>,
+    /// A button that offers a way on, as an error's Show in Finder: its
+    /// label, to translate, and what it does.
+    pub offer: Option<(&'static str, Action)>,
 }
 
 impl Toast {
@@ -3307,6 +3332,10 @@ pub enum Action {
     RemoveGroupPicture(ChatId),
     /// Sets or resets (`None`) the folder for new downloads.
     SetDownloadFolder(Option<PathBuf>),
+    /// When unopened attachments leave the media cache.
+    SetCacheAge(crate::settings::CacheAge),
+    /// How big the media cache may grow.
+    SetCacheLimit(crate::settings::CacheLimit),
     /// Keeps archived chats archived when a new message comes, or not.
     SetKeepChatsArchived(bool),
     /// Picks the microphone calls and voice messages use; `None` follows the

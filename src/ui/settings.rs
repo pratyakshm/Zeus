@@ -530,18 +530,28 @@ fn sections(app: &App) -> Vec<Section> {
             );
         }
     }
-    appearance.toggle(
-        translated(locale, "Blur"),
-        translated(
-            locale,
-            if cfg!(target_os = "macos") {
-                "The desktop through the Messages theme's window. The chat header and the message field are solid on macOS. Off keeps the window solid too."
-            } else {
-                "Frosted glass under the chat header and the message field, and the desktop through the window where the system allows. Off keeps every surface solid."
-            },
-        ),
-        |settings| &mut settings.blur,
-    );
+    // On macOS the header and the message field are solid under Metal
+    // (`backdrop::blur`), so Glass's tint would change nothing there: only
+    // whether the Messages theme's window shows the desktop is left, a switch.
+    if cfg!(target_os = "macos") {
+        appearance.row(
+            translated(locale, "Blur"),
+            translated(
+                locale,
+                "The desktop through the Messages theme's window. The chat header and the message field are solid on macOS. Off keeps the window solid too.",
+            ),
+            blur_switch,
+        );
+    } else {
+        appearance.row(
+            translated(locale, "Glass"),
+            translated(
+                locale,
+                "How much shows through the frosted chat header, message field and menus, and the desktop through the window where the system allows. Solid keeps every surface opaque, as it is while the system reduces transparency.",
+            ),
+            glass_slider,
+        );
+    }
     appearance.toggle(
         translated(locale, "Always show time"),
         translated(
@@ -1057,6 +1067,22 @@ fn sections(app: &App) -> Vec<Section> {
             translated(locale, "Clear…"),
         ],
         storage_usage,
+    );
+    files.row(
+        translated(locale, "Remove unopened files"),
+        translated(
+            locale,
+            "Downloaded attachments you have not opened for this long are deleted from this computer. They download again when you open them.",
+        ),
+        cache_age_picker,
+    );
+    files.row(
+        translated(locale, "Cache size limit"),
+        translated(
+            locale,
+            "When downloads take more than this, the ones opened longest ago are deleted first.",
+        ),
+        cache_limit_picker,
     );
     let log = app.dirs.log_file();
     files.row(
@@ -1713,7 +1739,7 @@ fn chat_preview(ui: &mut egui::Ui, app: &mut App) {
 }
 
 /// Seconds the pill's fill takes to reach a new segment.
-const SLIDE_SECONDS: f64 = 0.22;
+const SLIDE_SECONDS: f64 = theme::MOTION_PANEL as f64;
 
 /// Where the fill is, in segments, `target` being where it is going: it
 /// leaves where it was drawn last and eases out to `target`.
@@ -1723,7 +1749,7 @@ fn slide_position(ui: &egui::Ui, id: egui::Id, target: f32) -> f32 {
         .data(|data| data.get_temp::<(f32, f32, f64)>(id))
         .unwrap_or((target, target, now - SLIDE_SECONDS));
     let progress = (((now - since) / SLIDE_SECONDS) as f32).clamp(0.0, 1.0);
-    let here = from + (to - from) * egui::emath::easing::cubic_out(progress);
+    let here = from + (to - from) * theme::ease_out(progress);
     let (from, to, since) = if to == target {
         (from, to, since)
     } else {
@@ -1736,7 +1762,7 @@ fn slide_position(ui: &egui::Ui, id: egui::Id, target: f32) -> f32 {
     if to == target && progress >= 1.0 {
         target
     } else {
-        from + (to - from) * egui::emath::easing::cubic_out(((now - since) / SLIDE_SECONDS) as f32)
+        from + (to - from) * theme::ease_out(((now - since) / SLIDE_SECONDS) as f32)
     }
 }
 
@@ -2459,8 +2485,8 @@ fn wallpaper_color_button(
         let t = ui.ctx().animate_bool_with_time_and_easing(
             response.id,
             chosen,
-            0.16,
-            egui::emath::easing::quadratic_out,
+            theme::MOTION_QUICK,
+            theme::ease_out,
         );
         let painter = ui.painter_at(rect.expand(6.0));
         painter.rect_filled(rect, radius, fill);
@@ -2569,8 +2595,8 @@ fn doodle_cards(ui: &mut egui::Ui, app: &mut App) {
             let t = ui.ctx().animate_bool_with_time_and_easing(
                 response.id,
                 chosen,
-                0.16,
-                egui::emath::easing::quadratic_out,
+                theme::MOTION_QUICK,
+                theme::ease_out,
             );
             let painter = ui.painter_at(rect.expand(6.0));
             let r = radius as u8;
@@ -2821,6 +2847,50 @@ fn storage_usage(ui: &mut egui::Ui, app: &mut App) {
             storage_bar_row(ui, &palette, &label, count, bytes, total);
         }
     }
+}
+
+fn cache_age_picker(ui: &mut egui::Ui, app: &mut App) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let selected = app.settings.cache_age;
+    controls::dropdown(
+        ui,
+        &palette,
+        "cache-age",
+        &crate::i18n::gettext(locale, "Remove unopened files"),
+        &crate::i18n::gettext(locale, selected.label()),
+        controls::WIDTH,
+        |ui| {
+            for choice in crate::settings::CacheAge::ALL {
+                let label = crate::i18n::gettext(locale, choice.label());
+                if controls::option(ui, &palette, &label, selected == choice) {
+                    app.actions.push(Action::SetCacheAge(choice));
+                }
+            }
+        },
+    );
+}
+
+fn cache_limit_picker(ui: &mut egui::Ui, app: &mut App) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let selected = app.settings.cache_limit;
+    controls::dropdown(
+        ui,
+        &palette,
+        "cache-limit",
+        &crate::i18n::gettext(locale, "Cache size limit"),
+        &crate::i18n::gettext(locale, selected.label()),
+        controls::WIDTH,
+        |ui| {
+            for choice in crate::settings::CacheLimit::ALL {
+                let label = crate::i18n::gettext(locale, choice.label());
+                if controls::option(ui, &palette, &label, selected == choice) {
+                    app.actions.push(Action::SetCacheLimit(choice));
+                }
+            }
+        },
+    );
 }
 
 /// One labelled bar: the kind, how many files and how much they weigh, and
@@ -3257,6 +3327,64 @@ fn toggle(
         *field(&mut app.settings) = value;
         app.actions.push(Action::SettingsChanged);
     }
+}
+
+/// Settings' Blur on macOS, where the glass is always solid
+/// (`backdrop::blur`): whether the Messages theme's window shows the desktop.
+/// Off is Glass's Solid end, as everywhere else.
+fn blur_switch(ui: &mut egui::Ui, app: &mut App) {
+    let palette = app.palette;
+    let mut on = app.settings.blur;
+    let response = widgets::switch(ui, &palette, &mut on);
+    theme::reveal_focus(&response);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), on, "Blur")
+    });
+    if response.changed() {
+        let tint = if !on {
+            1.0
+        } else if app.settings.glass < 1.0 {
+            app.settings.glass
+        } else {
+            crate::backdrop::GLASS_DEFAULT
+        };
+        app.settings.set_glass(tint);
+        app.actions.push(Action::SettingsChanged);
+    }
+}
+
+/// Settings' Glass, from Clear to Solid. While the system reduces
+/// transparency it shows Solid and cannot be moved.
+fn glass_slider(ui: &mut egui::Ui, app: &mut App) {
+    let palette = app.palette;
+    let reduced = crate::backdrop::system_reduces_transparency();
+    let mut tint = if reduced { 1.0 } else { app.settings.glass };
+    let clear = crate::i18n::gettext(app.locale, "Clear");
+    let solid = crate::i18n::gettext(app.locale, "Solid");
+    ui.add_enabled_ui(!reduced, |ui| {
+        ui.horizontal(|ui| {
+            theme::text(
+                ui,
+                clear.into_owned(),
+                theme::medium(12.5),
+                palette.secondary,
+            );
+            let slider = widgets::glass_slider(ui, &palette, &mut tint, 0.0..=1.0, 150.0);
+            slider.widget_info(|| {
+                egui::WidgetInfo::slider(ui.is_enabled(), f64::from(tint), "Glass")
+            });
+            theme::text(
+                ui,
+                solid.into_owned(),
+                theme::medium(12.5),
+                palette.secondary,
+            );
+            if slider.changed() {
+                app.settings.set_glass(tint);
+                app.actions.push(Action::SettingsChanged);
+            }
+        });
+    });
 }
 
 fn account_toggle(

@@ -7,7 +7,7 @@
 //! decodes still pictures at the size they are drawn at ([`install`]).
 //! [`sweep`] forgets the images nothing has drawn for a minute, and the ones
 //! that fall out of the resident window, which holds 96 images and 64 MiB of
-//! textures at most besides the ones on screen.
+//! textures at most besides the ones on screen, whichever loader made them.
 
 mod loader;
 
@@ -242,6 +242,7 @@ pub fn sweep(ctx: &egui::Context) {
     let stale = {
         let registry = registry(ctx);
         let mut entries = registry.0.lock().unwrap_or_else(|p| p.into_inner());
+        measure(ctx, &mut entries);
         let stale = stale(&entries, frame, now);
         for uri in &stale {
             entries.remove(uri);
@@ -250,6 +251,33 @@ pub fn sweep(ctx: &egui::Context) {
     };
     for uri in stale {
         ctx.forget_image(&uri);
+    }
+}
+
+/// Counts the textures egui's own loaders made for registered images, which
+/// are named after their URI, toward the byte budget: an avatar or a sticker
+/// that is not Zeus's loader's holds texture memory too.
+fn measure(ctx: &egui::Context, entries: &mut HashMap<String, Entry>) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut sizes: HashMap<&str, usize> = HashMap::new();
+    let manager = ctx.tex_manager();
+    let manager = manager.read();
+    for (_, meta) in manager.allocated() {
+        if let Some((uri, _)) = entries.get_key_value(meta.name.as_str()) {
+            *sizes.entry(uri.as_str()).or_default() += meta.bytes_used();
+        }
+    }
+    let sizes: Vec<(String, usize)> = sizes
+        .into_iter()
+        .map(|(uri, bytes)| (uri.to_owned(), bytes))
+        .collect();
+    drop(manager);
+    for (uri, bytes) in sizes {
+        if let Some(entry) = entries.get_mut(&uri) {
+            entry.texture = bytes;
+        }
     }
 }
 
@@ -471,6 +499,64 @@ mod tests {
         );
         assert_eq!(allocated(&ctx), shown - 8);
         empty.textures_delta.clear();
+    }
+
+    /// Answers every URI with a 1024-pixel square: 4 MB of texture.
+    struct LargeLoader;
+
+    impl egui::load::ImageLoader for LargeLoader {
+        fn id(&self) -> &str {
+            "zeus::image_cache::tests::LargeLoader"
+        }
+
+        fn load(
+            &self,
+            _ctx: &egui::Context,
+            _uri: &str,
+            _size_hint: egui::load::SizeHint,
+        ) -> egui::load::ImageLoadResult {
+            Ok(egui::load::ImagePoll::Ready {
+                image: std::sync::Arc::new(egui::ColorImage::filled(
+                    [1024, 1024],
+                    egui::Color32::WHITE,
+                )),
+            })
+        }
+
+        fn forget(&self, _uri: &str) {}
+
+        fn forget_all(&self) {}
+
+        fn byte_size(&self) -> usize {
+            0
+        }
+    }
+
+    /// Textures egui's own loaders made count toward the budget too.
+    #[test]
+    fn big_textures_that_scroll_away_are_released_past_the_budget() {
+        let ctx = context();
+        ctx.add_image_loader(std::sync::Arc::new(LargeLoader));
+        let uris: Vec<String> = (0..80).map(uri).collect();
+        for uri in &uris {
+            include(&ctx, uri, b"image bytes");
+        }
+        let mut output = draw(&ctx, &uris);
+        output.textures_delta.clear();
+        let used = |ctx: &egui::Context| -> usize {
+            let manager = ctx.tex_manager();
+            let manager = manager.read();
+            manager
+                .allocated()
+                .filter(|(_, meta)| meta.name.starts_with("bytes://test-"))
+                .map(|(_, meta)| meta.bytes_used())
+                .sum()
+        };
+        assert!(used(&ctx) > BUDGET, "what is on screen stays");
+        let mut output = draw(&ctx, &[]);
+        output.textures_delta.clear();
+        assert!(used(&ctx) <= BUDGET, "kept {} bytes", used(&ctx));
+        assert!(used(&ctx) > BUDGET - 8 * 1024 * 1024, "kept too little");
     }
 
     fn size(width: u32, height: u32, fit: bool) -> egui::load::SizeHint {

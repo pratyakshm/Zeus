@@ -90,8 +90,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 let ease = HEADER_TAIL + bar.height() * HEADER_EASE;
                 ui.painter()
                     .set(glass, super::glass::shape(frosted, ease, radius));
-                ui.painter()
-                    .set(veil, header_veil(&app.palette, frosted, ease, radius));
+                ui.painter().set(
+                    veil,
+                    header_veil(
+                        app.palette.vibrant_header(app.palette.chat),
+                        frosted,
+                        ease,
+                        radius,
+                    ),
+                );
                 // Over messages scrolled up under the header's corners.
                 card_corners(ui, &app.palette, card, radius);
                 bar
@@ -160,9 +167,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let list = area.with_min_y(bar.top());
         // A strip opening over the field slides the messages up with it, so
         // the last one is never left behind it.
-        let over =
-            ui.ctx()
-                .animate_value_with_time(ui.id().with("composer-over"), foot.height(), 0.15);
+        let over = ui.ctx().animate_value_with_time(
+            ui.id().with("composer-over"),
+            foot.height(),
+            theme::MOTION_QUICK,
+        );
         ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
             messages(app, ui, &chat, bar.height(), over);
         });
@@ -407,19 +416,18 @@ fn empty(app: &mut App, ui: &mut egui::Ui) {
 
 /// The share of a vibrant header, from its bottom, over which its frost and
 /// veil begin to ease off.
-const HEADER_EASE: f32 = 0.35;
+pub(super) const HEADER_EASE: f32 = 0.35;
 /// How far below a vibrant header its frost and veil carry on, easing off.
-const HEADER_TAIL: f32 = 24.0;
+pub(super) const HEADER_TAIL: f32 = 24.0;
 /// Rows of the veil's ease, enough for its curve to look smooth.
 const VEIL_STEPS: usize = 8;
 
-/// The veil over a vibrant header's frost: the palette's at the top, then
+/// The veil over a vibrant header's frost: `top` at the top, then
 /// easing to nothing over the bottom `ease` points of `rect` along the same
 /// curve as the frost, so the messages under it never stop at a line. Its
 /// top corners follow the card's `radius`, so they stay round over a
 /// see-through window too.
-fn header_veil(palette: &Palette, rect: Rect, ease: f32, radius: f32) -> egui::Shape {
-    let top = palette.vibrant_header(palette.chat);
+pub(super) fn header_veil(top: Color32, rect: Rect, ease: f32, radius: f32) -> egui::Shape {
     let start = rect.bottom() - ease;
     let radius = radius.clamp(0.0, (rect.height() - ease).max(0.0));
     let mut mesh = egui::Mesh::default();
@@ -468,10 +476,10 @@ const NAME_GLASS_LINES: f32 = 32.0;
 /// How wide the round glass under each of a vibrant header's buttons is.
 const BUTTON_GLASS: f32 = 36.0;
 /// The space between two of a vibrant header's buttons, beyond their glass.
-const BUTTON_GAP: f32 = 10.0;
+pub(super) const BUTTON_GAP: f32 = 10.0;
 
 /// The round glass under one of a vibrant header's buttons.
-fn glass_button(palette: &Palette, button: Rect) -> egui::Shape {
+pub(super) fn glass_button(palette: &Palette, button: Rect) -> egui::Shape {
     glass(
         palette,
         Rect::from_center_size(button.center(), Vec2::splat(BUTTON_GLASS)),
@@ -1707,8 +1715,8 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     let mode_fade = ui.ctx().animate_bool_with_time_and_easing(
                         egui::Id::new(("picker-mode", app.settings.picker_mode as u8)),
                         true,
-                        0.18,
-                        egui::emath::easing::quadratic_out,
+                        theme::MOTION_QUICK,
+                        theme::ease_out,
                     );
                     let smile = last_line(ui, line, |ui| ui.scope(|ui| {
                         ui.multiply_opacity(mode_fade);
@@ -2430,6 +2438,10 @@ struct View<'a> {
     /// What touchpad swipes do in the open chat; only a reply is the
     /// message rows' to do.
     swipes: crate::settings::Swipes,
+    /// How strongly doodles show behind the bubbles and the colour under
+    /// them, when there are any: each bubble lays a soft scrim over them
+    /// (#29).
+    doodles: Option<(f32, Color32)>,
 }
 
 /// Protocol album parent carried by pictures and ordinary videos.
@@ -2460,6 +2472,16 @@ fn album_run(messages: &[Message], start: usize) -> Option<&[Message]> {
         end += 1;
     }
     (end > start + 1).then_some(&messages[start..end])
+}
+
+/// The colours egui paints a scroll bar's handle in, idle, hovered, and held.
+fn handle_colors(visuals: &mut egui::Visuals) -> [&mut egui::Color32; 3] {
+    let widgets = &mut visuals.widgets;
+    [
+        &mut widgets.inactive.fg_stroke.color,
+        &mut widgets.hovered.fg_stroke.color,
+        &mut widgets.active.fg_stroke.color,
+    ]
 }
 
 /// A row height to assume for a message that has not been laid out yet. Rows
@@ -2568,7 +2590,7 @@ fn shows_sender_pictures(chat: &Chat) -> bool {
 /// How long the sticky date stays after the transcript stops moving.
 const STICKY_DATE_HOLD: f64 = 1.0;
 /// How long the sticky date takes to fade out.
-const STICKY_DATE_FADE: f32 = 0.25;
+const STICKY_DATE_FADE: f32 = theme::MOTION_PANEL;
 
 /// Keeps the first visible message's date at the top of the transcript once
 /// its day separator has scrolled away, while the reader scrolls: it fades
@@ -2860,6 +2882,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
         copy_rows: (!app.selection.as_ref().is_some_and(|(id, _)| *id == chat.id))
             .then_some(app.copy_rows.as_ref()),
         swipes: app.settings.swipes,
+        doodles: app.doodles_behind(),
     };
     let mut actions = Vec::new();
     let mut anchored = false;
@@ -2943,9 +2966,14 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
             .collect();
         rows.retain(|id, _| ids.contains(id.as_str()));
     }
-    // How far rows entirely above the viewport grew this frame. The offset
-    // follows, so what the reader looks at stays put while rows scrolled past
-    // are measured for the first time.
+    // The row the reader's view started at last frame, and where its top lay
+    // in the transcript. Wherever it lies now, the offset follows by the
+    // difference, so what the reader looks at stays put while rows above it
+    // change: rows scrolled past measured for the first time, a page of older
+    // history arriving at the top as the reader scrolls up, or a picture
+    // above the view taking its height.
+    let last_top_row = conversation.top_row.take();
+    let mut top_row: Option<(String, f32)> = None;
     let mut grew_above = 0.0;
     // The offset the message list is about to load, the distance a Home
     // scroll still has to cover: the same id the `ScrollArea` below loads.
@@ -2956,6 +2984,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
     let scroll_state = egui::scroll_area::State::load(ui.ctx(), scroll_id);
     // The list has not been shown before: it starts at the top.
     let first_show = scroll_state.is_none();
+    let redo_scroll_id = scroll_id.with("redo-scroll");
     let offset = scroll_state.map_or(0.0, |state| state.offset.y);
     // A keyboard scroll under way stops for a jump to a message, for the
     // reaction bar, which holds the view still, and for a wheel or trackpad
@@ -3007,6 +3036,10 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
         clear.x_range(),
         (clear.top() + under)..=(clear.bottom() - over).max(clear.top() + under),
     );
+    // The scroll bar's handle takes the accent, as the chat list's does; the
+    // rows put the plain colours back for their own widgets.
+    let accent = ui.visuals().selection.stroke.color;
+    let plain = handle_colors(ui.visuals_mut()).map(|color| std::mem::replace(color, accent));
     let output = egui::ScrollArea::vertical()
         .id_salt(("messages", &chat.id))
         .scroll_bar_rect(bar_rect)
@@ -3019,13 +3052,30 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
         })
         .animated(false)
         .show(ui, |ui| {
+            for (color, plain) in handle_colors(ui.visuals_mut()).into_iter().zip(plain) {
+                *color = plain;
+            }
             // Scroll while selecting near an edge. `scroll_with_delta` also
             // releases stick-to-bottom; setting the offset directly does not.
             let viewport = ui.clip_rect();
+            // Where the transcript starts, so a row's place in it does not
+            // depend on the offset.
+            let content_top = ui.max_rect().top();
             *app.selection_view.lock().unwrap_or_else(|p| p.into_inner()) = Some(viewport);
             if carried != 0.0 {
                 ui.scroll_with_delta_animation(
                     vec2(0.0, carried),
+                    egui::style::ScrollAnimation::none(),
+                );
+            }
+            // What the pass before this redo scrolled, once it is painted.
+            if let Some(scrolled) = ui
+                .ctx()
+                .data_mut(|data| data.remove_temp::<f32>(redo_scroll_id))
+                .filter(|_| redo)
+            {
+                ui.scroll_with_delta_animation(
+                    vec2(0.0, -scrolled),
                     egui::style::ScrollAnimation::none(),
                 );
             }
@@ -3161,6 +3211,14 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
                         });
                         if new_day {
                             day_separator_top = before + 8.0;
+                        }
+                        if top_row.is_none() && before >= viewport.top() - 0.5 {
+                            top_row = Some((message.id.clone(), before - content_top));
+                        }
+                        if let Some((id, was)) = &last_top_row
+                            && *id == message.id
+                        {
+                            grew_above = before - content_top - was;
                         }
                         let here = notices_above(&notices[placed..], message.timestamp);
                         let known = rows.get(&message.id).copied();
@@ -3561,9 +3619,6 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
                         {
                             visible_day = Some((message.timestamp, day_separator_top));
                         }
-                        if before + height <= viewport.top() {
-                            grew_above += measured - height;
-                        }
                         rows.insert(
                             message.id.clone(),
                             RowHeight {
@@ -3666,6 +3721,9 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
                 ui.ctx().request_repaint();
             }
         });
+    for (color, plain) in handle_colors(ui.visuals_mut()).into_iter().zip(plain) {
+        *color = plain;
+    }
     glide_new_message(ui, &chat.id, newest, &output, layer, first_shape);
     app.scroll_route
         .place(crate::app::ScrollPane::Messages, output.inner_rect);
@@ -3703,9 +3761,11 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
     let fetching_explicit = conversation.phone_explicit;
     let exhausted = conversation.phone_exhausted;
     conversation.rows = rows;
+    conversation.top_row = top_row;
     // Keep the rows on screen where they were when rows above them changed
-    // height, unless this frame scrolled on purpose (to the end, a jump, or
-    // the divider) or sticks to the end, where egui keeps the offset anyway.
+    // height or arrived, unless this frame scrolled on purpose (to the end, a
+    // jump, or the divider) or sticks to the end, where egui keeps the offset
+    // anyway.
     // Home targets an absolute offset (0), so it is skipped while Home
     // scrolls, rather than pushing the offset away from the top; PgUp/PgDn
     // steps are relative and still get it. The pass is redone at the new
@@ -3716,11 +3776,23 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
         && !at_bottom
         && key_scroll.is_none_or(|scroll| scroll.kind != Scroll::Top)
     {
-        let mut state = output.state;
-        state.offset.y = (state.offset.y + grew_above).max(0.0);
-        state.store(ui.ctx(), output.id);
         ui.ctx()
             .request_discard("transcript rows above the viewport changed height");
+        let mut state = output.state;
+        if ui.ctx().will_discard() {
+            // The redo paints where this pass did, moved by the shift alone,
+            // and scrolls by what this pass scrolled only after painting, as
+            // every frame does. Started from the scrolled offset, it would
+            // paint this frame's scroll at once and the next frame's not at
+            // all: a stutter each time a row was measured mid-scroll.
+            let scrolled = state.offset.y - offset;
+            state.offset.y = (offset + grew_above).max(0.0);
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(redo_scroll_id, scrolled));
+        } else {
+            state.offset.y = (state.offset.y + grew_above).max(0.0);
+        }
+        state.store(ui.ctx(), output.id);
     }
     // A jump to the end moves the offset only after the rows were painted at
     // the old one. On a chat's first showing that is the top of its first
@@ -3842,8 +3914,12 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
     let appear = ui.ctx().animate_bool_with_time_and_easing(
         ui.id().with("to-bottom"),
         !at_bottom,
-        if reduce_motion { 0.0 } else { 0.18 },
-        egui::emath::easing::quadratic_out,
+        if reduce_motion {
+            0.0
+        } else {
+            theme::MOTION_QUICK
+        },
+        theme::ease_out,
     );
     if appear > 0.0 {
         let rect = output.inner_rect;
@@ -4280,6 +4356,32 @@ pub(crate) fn flying_to(ctx: &egui::Context) -> Option<String> {
     ctx.data(|data| data.get_temp::<Vec<SendFlight>>(send_flight_id()))
         .and_then(|flights| flights.into_iter().find_map(|flight| flight.message))
         .map(|(id, _)| id)
+}
+
+/// How far a bubble's scrim reaches past its edge, and fades over.
+const SCRIM_REACH: f32 = 24.0;
+
+/// A soft, wide wash behind a bubble, so doodles fade out before they reach
+/// its text at any intensity (#29): the wallpaper's colour leaning towards
+/// the bubble's `fill`, so it reads as the bubble's shadow, not a glow.
+/// Stronger doodles get a stronger wash; none, none.
+fn doodle_scrim(
+    bubble: Rect,
+    fill: Color32,
+    doodles: Option<(f32, Color32)>,
+) -> Option<egui::Shape> {
+    let (intensity, wall) = doodles.filter(|(intensity, _)| *intensity > 0.0)?;
+    let strength = (0.45 + 0.15 * intensity).clamp(0.45, 0.8);
+    let [r, g, b, _] = wall.lerp_to_gamma(fill, 0.12).to_srgba_unmultiplied();
+    let wash = Color32::from_rgba_unmultiplied(r, g, b, (strength * 255.0).round() as u8);
+    Some(egui::Shape::Rect(
+        egui::epaint::RectShape::filled(
+            bubble.expand(SCRIM_REACH / 2.0),
+            CornerRadius::same(theme::RADIUS_CARD),
+            wash,
+        )
+        .with_blur_width(SCRIM_REACH),
+    ))
 }
 
 /// How old a message may be when first drawn and still be animated in: one
@@ -4915,13 +5017,13 @@ fn bubble_row(
         let animation_time = if reduce_motion {
             0.0
         } else {
-            ui.ctx().global_style().animation_time.min(0.24)
+            theme::MOTION_QUICK
         };
         let progress = ui.ctx().animate_bool_with_time_and_easing(
             metadata_id.with("reveal"),
             visible,
             animation_time,
-            egui::emath::easing::quadratic_out,
+            theme::ease_out,
         );
         if progress > 0.0 {
             let display_message = album.and_then(|members| members.last()).unwrap_or(message);
@@ -5712,7 +5814,8 @@ fn bubble_frame(
     let rect_id = bubble_id.with("rect");
     let previous = ui.ctx().data(|data| data.get_temp::<Rect>(rect_id));
     let early = previous.map(|rect| ui.interact(rect, bubble_id, Sense::CLICK));
-    // Painted once the contents are measured, beneath them.
+    // Painted once the contents are measured, beneath them, over a scrim.
+    let scrim = ui.painter().add(egui::Shape::Noop);
     let backdrop = ui.painter().add(egui::Shape::Noop);
     let tail = (tailed && fill != Color32::TRANSPARENT).then_some(if own {
         widgets::Side::Right
@@ -5828,6 +5931,9 @@ fn bubble_frame(
             }
         });
     if fill != Color32::TRANSPARENT && ui.is_rect_visible(inner.response.rect) {
+        if let Some(shape) = doodle_scrim(inner.response.rect, fill, view.doodles) {
+            ui.painter().set(scrim, shape);
+        }
         ui.painter().set(
             backdrop,
             if palette.bubbles == theme::BubbleStyle::Nothing {
@@ -7148,9 +7254,9 @@ fn reactions(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: &mu
         if crate::motion::screen_reader_attached(ui.ctx()) {
             0.0
         } else {
-            0.18
+            theme::MOTION_QUICK
         },
-        egui::emath::easing::quadratic_out,
+        theme::ease_out,
     );
     ui.multiply_opacity(arrived);
     let shown: Vec<&str> = counts
@@ -7351,6 +7457,7 @@ pub(crate) fn list_menu(
         account_receipts_off: app.account_receipts_off,
         copy_rows: Some(app.copy_rows.as_ref()),
         swipes: app.settings.swipes,
+        doodles: app.doodles_behind(),
         selecting: false,
         selected: &[],
         motion_playing: None,
@@ -9066,8 +9173,12 @@ fn album_download_button(
     let appear = ui.ctx().animate_bool_with_time_and_easing(
         id,
         !missing.is_empty(),
-        if reduce_motion { 0.0 } else { 0.18 },
-        egui::emath::easing::quadratic_out,
+        if reduce_motion {
+            0.0
+        } else {
+            theme::MOTION_QUICK
+        },
+        theme::ease_out,
     );
     if appear <= 0.0 {
         return;
@@ -9090,8 +9201,12 @@ fn album_download_button(
     let hover = ui.ctx().animate_bool_with_time_and_easing(
         id.with("hover"),
         response.hovered() && !downloading,
-        if reduce_motion { 0.0 } else { 0.12 },
-        egui::emath::easing::quadratic_out,
+        if reduce_motion {
+            0.0
+        } else {
+            theme::MOTION_QUICK
+        },
+        theme::ease_out,
     );
     let scale = (0.7 + 0.3 * appear) * (1.0 + 0.06 * hover);
     let disc = Rect::from_center_size(button.center(), button.size() * scale);
@@ -9100,7 +9215,7 @@ fn album_download_button(
     // Frosted over the pictures it floats on, as the other floating controls
     // are; a darker tint stands in while Blur is off.
     painter.add(super::glass::rounded(disc, disc.width() / 2.0));
-    let tint = if crate::backdrop::blur() { 85.0 } else { 170.0 };
+    let tint = 170.0 * crate::backdrop::tinted(0.5);
     painter.circle_filled(
         disc.center(),
         disc.width() / 2.0,
@@ -10189,7 +10304,17 @@ fn picture(
         if !ui.is_rect_visible(Rect::from_min_size(position, reserved)) {
             return ui.allocate_exact_size(reserved, Sense::hover()).0;
         }
+        // Stickers are WebP, which keep egui's own loader and their motion.
         let image = widgets::file_image(ui, path);
+        // While the picture decodes its blurred thumbnail stands in, and the
+        // sharp picture fades in over it once ready. One already decoded, as
+        // when scrolled back to, shows at once.
+        let placeholder = message
+            .thumbnail
+            .as_deref()
+            .filter(|_| sticker.is_none())
+            .map(|bytes| thumbnail_uri(ui.ctx(), &message.chat, &message.id, bytes));
+        let sharpen_id = pixels_id.with("sharpen");
         return match image.load_for_size(ui.ctx(), vec2(max_width, max_height)) {
             Ok(egui::load::TexturePoll::Ready { texture }) => {
                 if drawn != Some(texture.size) {
@@ -10197,10 +10322,31 @@ fn picture(
                         .data_mut(|data| data.insert_temp(pixels_id, texture.size));
                 }
                 let size = fit(texture.size);
+                let waited = ui
+                    .ctx()
+                    .data(|data| data.get_temp::<bool>(sharpen_id))
+                    .is_some();
+                let sharp = if waited {
+                    theme::animate(ui.ctx(), sharpen_id, true, theme::MOTION_PANEL)
+                } else {
+                    1.0
+                };
+                if sharp >= 1.0 && waited {
+                    ui.ctx().data_mut(|data| data.remove::<bool>(sharpen_id));
+                }
+                if sharp < 1.0
+                    && let Some(uri) = &placeholder
+                {
+                    egui::Image::new(uri.clone())
+                        .fit_to_exact_size(size)
+                        .corner_radius(radius)
+                        .paint_at(ui, Rect::from_min_size(ui.next_widget_position(), size));
+                }
                 let response = ui.add(
                     image
                         .fit_to_exact_size(size)
                         .corner_radius(if sticker.is_some() { 0.0 } else { radius })
+                        .tint(Color32::WHITE.gamma_multiply(sharp))
                         .sense(Sense::click()),
                 );
                 let rect = response.rect;
@@ -10234,9 +10380,22 @@ fn picture(
                     None => frame_size(media, None, max_width, max_height),
                 };
                 let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                if placeholder.is_some() {
+                    // The cross-fade starts from the thumbnail once ready.
+                    ui.ctx().animate_bool_with_time(sharpen_id, false, 0.0);
+                    ui.ctx().data_mut(|data| data.insert_temp(sharpen_id, true));
+                }
                 if ui.is_rect_visible(rect) {
-                    ui.painter().rect_filled(rect, radius, palette.surface);
-                    theme::paint_spinner(ui, rect, 22.0, palette.accent);
+                    match &placeholder {
+                        Some(uri) => egui::Image::new(uri.clone())
+                            .fit_to_exact_size(size)
+                            .corner_radius(radius)
+                            .paint_at(ui, rect),
+                        None => {
+                            ui.painter().rect_filled(rect, radius, palette.surface);
+                            theme::paint_spinner(ui, rect, 22.0, palette.accent);
+                        }
+                    }
                 }
                 rect
             }
@@ -11764,7 +11923,7 @@ fn chat_of(chat: &ChatId) -> &str {
 }
 
 /// How long an upload takes to rise into place when it is sent.
-const UPLOAD_ENTRANCE: f32 = 0.28;
+const UPLOAD_ENTRANCE: f32 = theme::MOTION_PANEL;
 /// How far below its place an upload starts its entrance.
 const UPLOAD_RISE: f32 = 14.0;
 /// The widest an upload's picture is drawn.
@@ -11788,10 +11947,10 @@ fn upload_rows(ui: &mut egui::Ui, palette: &Palette, uploads: &[crate::model::Up
         let id = ui.id().with(("upload", upload.id));
         let shown = ui.ctx().animate_bool_with_time(id, true, UPLOAD_ENTRANCE);
         // Eased out, so it settles softly.
-        let eased = 1.0 - (1.0 - shown).powi(3);
+        let eased = theme::ease_out(shown);
         let fraction = upload.fraction().map(|fraction| {
             ui.ctx()
-                .animate_value_with_time(id.with("progress"), fraction, 0.25)
+                .animate_value_with_time(id.with("progress"), fraction, theme::MOTION_PANEL)
         });
         let picture = upload.preview.as_ref().filter(|_| {
             matches!(
@@ -11800,11 +11959,204 @@ fn upload_rows(ui: &mut egui::Ui, palette: &Palette, uploads: &[crate::model::Up
             )
         });
         ui.add_space(RUN_GAP);
+        if upload.kind == crate::model::UploadKind::Sticker
+            && let Some(crate::model::UploadPreview::File(path)) = &upload.preview
+        {
+            upload_sticker(ui, palette, upload.id, path, eased);
+            continue;
+        }
         match picture {
             Some(preview) => upload_picture(ui, palette, preview, fraction, cap, eased),
             None => upload_card(ui, palette, upload, fraction, cap, eased),
         }
     }
+}
+
+/// How high, at most, a sticker flying from the picker arcs over its
+/// straight path.
+const STICKER_ARC: f32 = 64.0;
+/// How long a sticker takes to fly from the picker, as the drag-carry
+/// flights do.
+const STICKER_FLIGHT: f32 = theme::MOTION_SCREEN;
+/// The side of the "sending" chip under a sticker on its way.
+const STICKER_CHIP: f32 = 22.0;
+/// How much a sticker on its way is faded, until its message arrives.
+const STICKER_WAITING_FADE: f32 = 0.25;
+
+/// A sticker flying from its picker tile to its place in the chat.
+#[derive(Clone)]
+struct StickerFlight {
+    upload: crate::model::UploadId,
+    /// The tile it left, in screen coordinates.
+    from: Rect,
+    start: f64,
+    /// Where it lands and what it shows, as its row last laid it out; it
+    /// flies nowhere until the row has.
+    to: Option<(Rect, egui::TextureId)>,
+}
+
+fn flights_id() -> egui::Id {
+    egui::Id::new("sticker-flights")
+}
+
+/// Sends the sticker of `upload` flying from `from`, its tile in the picker,
+/// to its place at the end of the chat. Without motion it is simply there.
+pub fn launch_sticker(ctx: &egui::Context, upload: crate::model::UploadId, from: Rect) {
+    if crate::motion::screen_reader_attached(ctx) {
+        return;
+    }
+    let start = ctx.input(|input| input.time);
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<Vec<StickerFlight>>(flights_id())
+            .push(StickerFlight {
+                upload,
+                from,
+                start,
+                to: None,
+            });
+    });
+    ctx.request_repaint();
+}
+
+/// How far a flight that began at `start` has got, from 0 to 1.
+fn flight_progress(start: f64, now: f64) -> f32 {
+    ((now - start) / f64::from(STICKER_FLIGHT)).clamp(0.0, 1.0) as f32
+}
+
+/// Where a sticker flying from `from` to `to` is, `t` of the way: eased
+/// out, growing to its size, along a low arc.
+fn flight_rect(from: Rect, to: Rect, t: f32) -> Rect {
+    let eased = theme::ease_out(t.clamp(0.0, 1.0));
+    let center = from.center().lerp(to.center(), eased);
+    let size = from.size() + (to.size() - from.size()) * eased;
+    let arc = (from.center().distance(to.center()) * 0.25).min(STICKER_ARC);
+    let lift = arc * (std::f32::consts::PI * eased).sin();
+    Rect::from_center_size(center - vec2(0.0, lift), size)
+}
+
+/// Draws the stickers in flight over everything, after the chat has laid
+/// out where they land, and forgets the ones that have.
+pub fn paint_sticker_flights(ctx: &egui::Context) {
+    let Some(mut flights) = ctx.data(|data| data.get_temp::<Vec<StickerFlight>>(flights_id()))
+    else {
+        return;
+    };
+    let now = ctx.input(|input| input.time);
+    flights.retain(|flight| flight_progress(flight.start, now) < 1.0);
+    for flight in &flights {
+        let Some((to, texture)) = flight.to else {
+            continue;
+        };
+        let t = flight_progress(flight.start, now);
+        let rect = flight_rect(flight.from, to, t);
+        // It settles to the faded look of a sticker still on its way.
+        let tint = Color32::WHITE.gamma_multiply(1.0 - STICKER_WAITING_FADE * theme::ease_out(t));
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            flights_id().with(flight.upload),
+        ))
+        .image(
+            texture,
+            rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            tint,
+        );
+    }
+    if flights.is_empty() {
+        ctx.data_mut(|data| data.remove::<Vec<StickerFlight>>(flights_id()));
+    } else {
+        ctx.data_mut(|data| data.insert_temp(flights_id(), flights));
+        ctx.request_repaint();
+    }
+}
+
+/// The sticker's texture and natural size: an animation's first frame, or
+/// the picture.
+fn sticker_texture(ui: &egui::Ui, path: &Path, rect: Rect) -> Option<(egui::TextureId, Vec2)> {
+    if crate::ui::picker::moves(ui.ctx(), path) {
+        return match animation::frame(ui, path, rect, false) {
+            animation::Frame::Ready(texture) => Some((texture.id(), texture.size_vec2())),
+            _ => None,
+        };
+    }
+    let poll = widgets::file_image(ui, path)
+        .load_for_size(ui.ctx(), rect.size())
+        .ok()?;
+    Some((poll.texture_id()?, poll.size()?))
+}
+
+/// A sticker on its way: drawn where its message will be, at the right edge
+/// without a bubble, faded a little with a turning ring beside it. One sent
+/// from the picker flies there first, and rests once it lands.
+fn upload_sticker(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    upload: crate::model::UploadId,
+    path: &Path,
+    eased: f32,
+) {
+    let square = Vec2::splat(STICKER_SIDE);
+    let texture = sticker_texture(ui, path, Rect::from_min_size(ui.cursor().min, square));
+    let size = texture.map_or(square, |(_, natural)| fit_sticker(natural.x, natural.y));
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), size.y), Sense::hover());
+    let rest = Rect::from_min_size(pos2(row.right() - size.x, row.top()), size);
+    let now = ui.input(|input| input.time);
+    // The flight aims at the sticker's place, or at the bottom of the view
+    // while that is still below it.
+    let clip = ui.clip_rect();
+    let target = rest.translate(vec2(0.0, (clip.bottom() - rest.bottom()).min(0.0)));
+    let flying = ui.ctx().data_mut(|data| {
+        data.get_temp_mut_or_default::<Vec<StickerFlight>>(flights_id())
+            .iter_mut()
+            .find(|flight| flight.upload == upload && flight_progress(flight.start, now) < 1.0)
+            .map(|flight| {
+                flight.to = texture.map(|(texture, _)| (target, texture));
+            })
+            .is_some()
+    });
+    if flying {
+        return;
+    }
+    // One that did not fly rises into place as other uploads do.
+    let rect = rest.translate(vec2(0.0, UPLOAD_RISE * (1.0 - eased)));
+    let painter = ui.painter_at(row.expand(UPLOAD_RISE));
+    match texture {
+        Some((texture, _)) => {
+            painter.image(
+                texture,
+                rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE.gamma_multiply((1.0 - STICKER_WAITING_FADE) * eased),
+            );
+        }
+        None => {
+            painter.rect_filled(rect, theme::RADIUS, palette.surface.gamma_multiply(eased));
+            theme::paint_icon(
+                ui,
+                Icon::Sticker,
+                Rect::from_center_size(rect.center(), Vec2::splat(28.0)),
+                28.0,
+                palette.secondary.gamma_multiply(eased),
+            );
+        }
+    }
+    // Waiting for the phone's servers, so a ring turns without a number.
+    let chip = Rect::from_min_size(
+        rect.right_bottom() - Vec2::splat(STICKER_CHIP + 4.0),
+        Vec2::splat(STICKER_CHIP),
+    );
+    painter.circle_filled(
+        chip.center(),
+        STICKER_CHIP / 2.0,
+        Color32::from_black_alpha((120.0 * eased) as u8),
+    );
+    progress_ring(
+        ui,
+        chip.center(),
+        STICKER_CHIP / 2.0 - 5.0,
+        None,
+        Color32::WHITE.gamma_multiply(eased),
+    );
 }
 
 /// The bubble of an upload, at the right edge, `eased` of the way into place.
@@ -11998,6 +12350,7 @@ fn upload_card(
         crate::model::UploadKind::Video => Icon::Video,
         crate::model::UploadKind::Audio => Icon::Music,
         crate::model::UploadKind::Document => Icon::FileText,
+        crate::model::UploadKind::Sticker => Icon::Sticker,
     };
     theme::paint_icon(
         ui,
@@ -12289,6 +12642,23 @@ mod tests {
             Color32::WHITE,
         );
         assert!(!shape_follows_transcript(&handle, viewport));
+    }
+
+    #[test]
+    fn a_sticker_flight_leaves_its_tile_and_lands_in_place() {
+        let tile = Rect::from_min_size(pos2(40.0, 600.0), Vec2::splat(80.0));
+        let place = Rect::from_min_size(pos2(700.0, 400.0), Vec2::splat(STICKER_SIDE));
+        let near = |a: Rect, b: Rect| a.min.distance(b.min) < 0.01 && a.max.distance(b.max) < 0.01;
+        assert!(near(flight_rect(tile, place, 0.0), tile));
+        assert!(near(flight_rect(tile, place, 1.0), place));
+        // It arcs above the straight line between them on its way.
+        let middle = flight_rect(tile, place, 0.5);
+        let straight = tile.center().lerp(place.center(), theme::ease_out(0.5));
+        assert!(middle.center().y < straight.y);
+        assert_eq!(
+            flight_progress(1.0, 1.0 + f64::from(STICKER_FLIGHT) * 2.0),
+            1.0
+        );
     }
 
     #[test]
@@ -13139,6 +13509,7 @@ mod tests {
             account_receipts_off: false,
             copy_rows: Some(app.copy_rows.as_ref()),
             swipes: app.settings.swipes,
+            doodles: None,
             selecting: false,
             selected: &[],
             motion_playing: None,
@@ -14016,7 +14387,7 @@ fn pending_strip(app: &mut App, ui: &mut egui::Ui) {
     let animation_time = if reduce_motion {
         0.0
     } else {
-        ui.ctx().global_style().animation_time.min(0.24)
+        theme::MOTION_QUICK
     };
     // One attachment gets most of the panel, so a photo can be seen before it
     // goes out. Several share the width in pairs. Neither is a fixed size: the

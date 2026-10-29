@@ -160,6 +160,8 @@ impl ScrollRoute {
 }
 /// Delay after the last keystroke before clearing typing state.
 const COMPOSING_TIMEOUT: Duration = Duration::from_secs(4);
+/// How often the media caches are cleaned up while the app runs.
+const CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// How long an info toast stays, including its fade.
 pub const INFO_TOAST_LIFETIME: Duration = Duration::from_millis(3200);
 /// How long a toast with an Undo button stays.
@@ -168,6 +170,8 @@ pub const UNDO_TOAST_LIFETIME: Duration = Duration::from_millis(6000);
 const MAX_ERROR_TOASTS: usize = 3;
 /// Typing-state timeout when no stop event arrives.
 const TYPING_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long the dots stay after someone pauses, in case they type again.
+const TYPING_HOLD: Duration = Duration::from_millis(2500);
 /// How long other apps' media stays paused while the next voice message of a
 /// run downloads. A stalled download must not keep music paused for good.
 const VOICE_FETCH_HOLD: Duration = Duration::from_secs(10);
@@ -191,6 +195,11 @@ struct AtlasWatch {
     /// Whether the atlas was rebuilt during this unfocused spell.
     rebuilt_away: bool,
 }
+/// A reply to one of this many newest messages brings the reader to the end
+/// even from further up. Replying to anything older keeps their place: they
+/// most likely found it through search or by scrolling far up, and are still
+/// reading there (and scrolling through that much history would be slow).
+const FOLLOW_REPLY: usize = 25;
 
 /// Loaded chat history and paging state.
 #[derive(Default)]
@@ -219,6 +228,10 @@ pub struct Conversation {
     pub(crate) rows: HashMap<String, RowHeight>,
     /// The keyboard page, Home, or End scroll under way in the message list.
     pub(crate) key_scroll: Option<KeyScroll>,
+    /// The first row whose top was in the message list's view last frame,
+    /// and that top's distance from the start of the transcript, which the
+    /// list keeps in place when rows above it change height or arrive.
+    pub(crate) top_row: Option<(String, f32)>,
 }
 
 /// A keyboard scroll the message list eases through, one instant step per
@@ -256,7 +269,7 @@ impl KeyScroll {
             return 1.0;
         }
         // Ease out: a scroll a held key restarts still moves at once.
-        let eased = egui::emath::easing::cubic_out(t);
+        let eased = crate::theme::ease_out(t);
         let fraction = (eased - self.progress) / (1.0 - self.progress);
         self.progress = eased;
         fraction
@@ -276,6 +289,14 @@ pub(crate) struct RowHeight {
 }
 
 impl Conversation {
+    /// How many messages came after the one with `id`, if it is loaded.
+    fn newer_than(&self, id: &str) -> Option<usize> {
+        self.messages
+            .iter()
+            .rposition(|message| message.id == id)
+            .map(|index| self.messages.len() - 1 - index)
+    }
+
     fn merge(&mut self, incoming: Vec<Message>, older: bool) {
         // Prepend new older rows, but refresh duplicates too: on-demand
         // history can supply edits and phone ordering absent from our archive.
@@ -730,6 +751,9 @@ pub struct App {
     /// A newer release than this build, once GitHub has said so.
     pub update: Option<crate::updates::Release>,
     last_update_check: Option<Instant>,
+    /// When the media caches were last cleaned up on their own; `None` runs
+    /// the cleanup on the next frame.
+    last_cache_prune: Option<Instant>,
     /// The check the reader asked for from Settings, and what it found.
     pub update_check: crate::updates::Check,
     pub show_update: bool,
@@ -1541,6 +1565,7 @@ impl App {
             events_hidden: false,
             update: None,
             last_update_check: None,
+            last_cache_prune: None,
             update_check: crate::updates::Check::default(),
             show_update: false,
             update_download: Default::default(),
@@ -1958,6 +1983,14 @@ impl App {
         // The window is gone with the full screen it was in; a new one starts
         // at its normal size.
         self.call_fullscreen = false;
+    }
+
+    /// How strongly doodles show behind the open chat's bubbles, as a
+    /// multiple of the default, and the colour they are drawn over; none
+    /// when no doodles are drawn.
+    pub fn doodles_behind(&self) -> Option<(f32, egui::Color32)> {
+        let look = self.wallpaper();
+        (look.doodles && look.image.is_none()).then_some((look.intensity, look.color))
     }
 
     /// What the conversation shows behind its bubbles, for the chat and the
@@ -3025,7 +3058,8 @@ impl App {
         let needle = crate::util::search_key(self.search.trim());
         let locked = self.locked_folder_open();
         let filtering = !locked && needle.is_empty() && !self.show_archived;
-        let mut indices: Vec<usize> = self
+        // Each chat comes with whether it matched only loosely.
+        let mut indices: Vec<(bool, usize)> = self
             .chats
             .iter()
             .enumerate()
@@ -3049,39 +3083,46 @@ impl App {
                             && self.unread_kept.contains(&chat.id))
                 }
             })
-            .filter(|(_, chat)| {
+            .filter_map(|(index, chat)| {
                 // Inside the locked folder the typed text is the secret code,
                 // not a query to match.
-                (self.locked_folder && !self.chat_lock_authenticated())
-                    || needle.is_empty()
-                    || crate::util::search_key(&self.chat_title(chat)).contains(&needle)
+                if (self.locked_folder && !self.chat_lock_authenticated()) || needle.is_empty() {
+                    return Some((false, index));
+                }
+                let title = crate::util::search_key(&self.chat_title(chat));
+                let exact = title.contains(&needle)
                     || chat.phone().is_some_and(|phone| phone.contains(&needle))
                     || chat.last.as_ref().is_some_and(|last| {
                         crate::util::search_key(&last.summary).contains(&needle)
-                    })
+                    });
+                // A name with letters left out is found too, below the
+                // chats the search matches as typed.
+                (exact || crate::util::fuzzy_matches(&title, &needle)).then_some((!exact, index))
             })
-            .map(|(index, _)| index)
             .collect();
         // The Favorites chip keeps the phone's order below the pinned chats.
         let favorites_order = self.favorites_order();
-        indices.sort_by(|&a, &b| {
+        indices.sort_by(|&(loose_a, a), &(loose_b, b)| {
             let (a, b) = (&self.chats[a], &self.chats[b]);
-            b.pinned.cmp(&a.pinned).then_with(|| {
-                if a.pinned && b.pinned {
-                    b.pinned_at.cmp(&a.pinned_at).then(a.id.cmp(&b.id))
-                } else if favorites_order {
-                    a.favorite_position
-                        .cmp(&b.favorite_position)
-                        .then(a.id.cmp(&b.id))
-                } else {
-                    self.draft_priority(&b.id)
-                        .cmp(&self.draft_priority(&a.id))
-                        .then_with(|| self.sort_activity(b).cmp(&self.sort_activity(a)))
-                        .then(a.id.cmp(&b.id))
-                }
-            })
+            loose_a
+                .cmp(&loose_b)
+                .then_with(|| b.pinned.cmp(&a.pinned))
+                .then_with(|| {
+                    if a.pinned && b.pinned {
+                        b.pinned_at.cmp(&a.pinned_at).then(a.id.cmp(&b.id))
+                    } else if favorites_order {
+                        a.favorite_position
+                            .cmp(&b.favorite_position)
+                            .then(a.id.cmp(&b.id))
+                    } else {
+                        self.draft_priority(&b.id)
+                            .cmp(&self.draft_priority(&a.id))
+                            .then_with(|| self.sort_activity(b).cmp(&self.sort_activity(a)))
+                            .then(a.id.cmp(&b.id))
+                    }
+                })
         });
-        indices
+        indices.into_iter().map(|(_, index)| index).collect()
     }
 
     /// When a chat counts as last active for the list order: a chat holding a
@@ -3109,27 +3150,35 @@ impl App {
         if needle.is_empty() {
             return Vec::new();
         }
-        let mut contacts: Vec<&Contact> = self
+        // Each contact comes with whether it matched only loosely.
+        let mut contacts: Vec<(bool, &Contact)> = self
             .contacts
             .values()
             .filter(|contact| crate::model::phone_of(&contact.id).is_some())
             .filter(|contact| self.me.as_deref() != Some(contact.id.as_str()))
             .filter(|contact| !self.chats.iter().any(|chat| chat.id == contact.id))
-            .filter(|contact| {
-                contact
-                    .display_name()
-                    .is_some_and(|name| crate::util::search_key(name).contains(&needle))
+            .filter_map(|contact| {
+                let name = contact.display_name().map(crate::util::search_key);
+                let exact = name.as_ref().is_some_and(|name| name.contains(&needle))
                     || contact
                         .id
                         .split('@')
                         .next()
-                        .is_some_and(|phone| phone.contains(&needle))
+                        .is_some_and(|phone| phone.contains(&needle));
+                let loose = name
+                    .as_ref()
+                    .is_some_and(|name| crate::util::fuzzy_matches(name, &needle));
+                (exact || loose).then_some((!exact, contact))
             })
             .collect();
-        contacts
-            .sort_by_key(|contact| contact.display_name().unwrap_or(&contact.id).to_lowercase());
+        contacts.sort_by_key(|(loose, contact)| {
+            (
+                *loose,
+                contact.display_name().unwrap_or(&contact.id).to_lowercase(),
+            )
+        });
         contacts.truncate(15);
-        contacts
+        contacts.into_iter().map(|(_, contact)| contact).collect()
     }
 
     /// Archived chats with unread messages, for the Archived chip.
@@ -3270,6 +3319,21 @@ impl App {
         })
     }
 
+    /// A message in: whoever sent it has stopped typing it, without waiting
+    /// out the moment a pause keeps the dots for.
+    fn stop_typing_on_message(&mut self, chat: &str, message: &Message) {
+        if message.from_me {
+            return;
+        }
+        let direct = crate::model::ChatKind::from_id(chat) != crate::model::ChatKind::Group;
+        if let Some(typers) = self.typing.get_mut(chat) {
+            typers.retain(|(who, _)| !direct && *who != message.sender);
+            if typers.is_empty() {
+                self.typing.remove(chat);
+            }
+        }
+    }
+
     /// Active typers in a chat as id and display name.
     pub fn typing_in(&self, chat: &str) -> Vec<(String, String)> {
         self.typing
@@ -3347,6 +3411,20 @@ impl App {
                     if stats.is_some() {
                         self.storage_stats = stats;
                     }
+                }
+            }
+            Event::MediaPruned(removed) => {
+                let removed: std::collections::HashSet<PathBuf> = removed.into_iter().collect();
+                for conversation in self.conversations.values_mut() {
+                    for message in &mut conversation.messages {
+                        message.content.forget_files(&|path| removed.contains(path));
+                    }
+                }
+                // Settings shows the smaller cache.
+                if self.page == Page::Settings {
+                    self.storage_token += 1;
+                    let token = self.storage_token;
+                    self.backend.send(Command::LoadStorageStats { token });
                 }
             }
             Event::Link(status) => self.handle_link(status, live),
@@ -3559,7 +3637,11 @@ impl App {
                     self.refresh_viewer_album(&chat);
                 }
                 if live && self.open_chat.as_deref() == Some(chat.as_str()) {
-                    if !older && (self.at_bottom || was_empty) {
+                    if !older && was_empty {
+                        self.scroll_to_bottom = true;
+                    } else if !older && self.at_bottom {
+                        // Only a reader already at the end follows arrivals;
+                        // anyone scrolled up keeps reading where they are.
                         self.scroll_to_bottom = true;
                     }
                     // Someone reading the end as it arrives has nothing unread.
@@ -3661,7 +3743,10 @@ impl App {
                         .collect();
                 }
             }
-            Event::Incoming { chat, message } => self.maybe_notify(&chat, &message),
+            Event::Incoming { chat, message } => {
+                self.stop_typing_on_message(&chat, &message);
+                self.maybe_notify(&chat, &message);
+            }
             Event::Picked {
                 chat,
                 paths,
@@ -3843,9 +3928,20 @@ impl App {
                 composing,
             } => {
                 let typers = self.typing.entry(chat).or_default();
-                typers.retain(|(who, _)| *who != sender);
-                if composing {
-                    typers.push((sender, Instant::now()));
+                let now = Instant::now();
+                match typers.iter_mut().find(|(who, _)| *who == sender) {
+                    Some((_, since)) if composing => *since = now,
+                    // Someone who types a letter, stops, and types again
+                    // sends a pause between each: the dots stay a moment
+                    // after one, so they do not flicker on and off.
+                    Some((_, since)) => {
+                        let fading = now
+                            .checked_sub(TYPING_TIMEOUT - TYPING_HOLD)
+                            .unwrap_or(*since);
+                        *since = (*since).min(fading);
+                    }
+                    None if composing => typers.push((sender, now)),
+                    None => {}
                 }
             }
             Event::Presence {
@@ -4940,6 +5036,13 @@ impl App {
             .media
             .iter()
             .map(|row| crate::ui::info::thumbnail_uri(&row.chat, &row.id))
+            // The Links tab's previews follow the pictures.
+            .chain(
+                media
+                    .links
+                    .iter()
+                    .filter_map(|link| crate::ui::info::link_uri(&media.chat, link)),
+            )
             .collect();
         let listed: HashSet<&str> = uris.iter().map(String::as_str).collect();
         // One dropped earlier and listed again before a frame stays.
@@ -5775,12 +5878,34 @@ impl App {
         self.last_keystroke = None;
     }
 
-    /// Keeps following outgoing messages only when the reader was already at
-    /// the newest edge. Sending from older history must not lose their place.
-    fn follow_outgoing(&mut self) {
+    /// Brings the reader to what they sent when they were at the end, or
+    /// replied to one of the newest messages. Sending from older history, or
+    /// replying to an old message found by search, keeps their place.
+    fn follow_outgoing(&mut self, quoting: Option<&crate::model::ReplyTarget>) {
         self.follow_sent_chat();
+        let Some(chat) = self.open_chat.clone() else {
+            return;
+        };
+        let follow = match quoting.filter(|target| target.source_chat(&chat) == chat) {
+            Some(target) => self
+                .conversations
+                .get(&chat)
+                .and_then(|conversation| conversation.newer_than(&target.id))
+                .is_some_and(|newer| newer < FOLLOW_REPLY),
+            None => self.at_bottom,
+        };
+        if follow {
+            self.scroll_to_end();
+        }
+    }
+
+    /// Pins the open chat to its end: at once from the end itself, or with
+    /// the eased End-key scroll from further up, which stays pinned after.
+    fn scroll_to_end(&mut self) {
         if self.at_bottom {
             self.scroll_to_bottom = true;
+        } else {
+            self.scroll_page = Some(Scroll::Bottom);
         }
     }
 
@@ -5802,13 +5927,14 @@ impl App {
         longitude: f64,
         quoting: Option<crate::model::ReplyTarget>,
     ) {
+        let quoted = quoting.clone();
         self.backend.send(Command::SendLocation {
             chat,
             latitude,
             longitude,
             quoting,
         });
-        self.follow_outgoing();
+        self.follow_outgoing(quoted.as_ref());
     }
 
     /// Dispatches composed text with its explicit quote target and restores it on refusal.
@@ -5851,13 +5977,14 @@ impl App {
         }
         // The text is on its way, so there is nothing left to restore.
         self.store_draft(&chat, "");
+        let quoted = quoting.clone();
         self.backend.send(Command::SendText {
             chat,
             text,
             quoting,
             mentions,
         });
-        self.follow_outgoing();
+        self.follow_outgoing(quoted.as_ref());
     }
 
     /// Snapshots selected mentions before the view queues an attachment send.
@@ -6011,6 +6138,7 @@ impl App {
         self.composer_mentions = selected;
         // The reply travels with the first attachment, like the caption.
         let mut quoting = self.reply_to.take();
+        let quoted = quoting.clone();
         let caption = caption.trim().to_owned();
         let (caption, mentions) = self.encode_composer_mentions(&chat, caption);
         let caption = Some(caption).filter(|text| !text.is_empty());
@@ -6087,7 +6215,7 @@ impl App {
         }
         // Everything staged has gone, so nothing is remembered about it.
         self.forget_unstaged_pictures();
-        self.follow_outgoing();
+        self.follow_outgoing(quoted.as_ref());
     }
 
     #[allow(dead_code)]
@@ -6114,7 +6242,7 @@ impl App {
             quoting: None,
             uploads: Vec::new(),
         });
-        self.follow_outgoing();
+        self.follow_outgoing(None);
     }
 
     /// Shows an attachment at the end of its chat while it goes, and names it
@@ -6138,6 +6266,30 @@ impl App {
             total: 0,
         });
         id
+    }
+
+    /// Cleans up every account's media cache as Settings > Storage asks, at
+    /// start, when the choice changes, and every [`CACHE_PRUNE_INTERVAL`].
+    fn maybe_prune_caches(&mut self, ctx: &egui::Context) {
+        let max_age = self.settings.cache_age.max_age();
+        let max_bytes = self.settings.cache_limit.max_bytes();
+        if max_age.is_none() && max_bytes.is_none() {
+            return;
+        }
+        if self
+            .last_cache_prune
+            .is_some_and(|at| at.elapsed() < CACHE_PRUNE_INTERVAL)
+        {
+            return;
+        }
+        self.last_cache_prune = Some(Instant::now());
+        for account in &self.accounts {
+            account
+                .backend
+                .send(Command::PruneMediaCache { max_age, max_bytes });
+        }
+        // An idle window paints nothing, so wake it for the next cleanup.
+        ctx.request_repaint_after(CACHE_PRUNE_INTERVAL);
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
@@ -6172,6 +6324,7 @@ impl App {
             ctx.request_repaint_after(crate::updates::CHECK_INTERVAL);
         }
         self.maybe_download_update();
+        self.maybe_prune_caches(ctx);
         if self.settings_dirty && self.last_settings_save.elapsed() > Duration::from_secs(2) {
             self.save_settings();
         }
@@ -6431,7 +6584,7 @@ impl App {
                     == egui::Theme::Dark
             }
         };
-        crate::backdrop::set_blur(self.settings.blur);
+        crate::backdrop::set_glass(self.settings.glass_shown());
         let palette = self.settings.palette(dark);
         if crate::theme::apply_text_rendering_change(ctx) {
             self.applied_dark = None;
@@ -6862,13 +7015,14 @@ impl App {
             } => {
                 if self.link.is_connected() && self.chat(&chat).is_some_and(|chat| chat.can_send())
                 {
+                    let quoted = crate::model::ReplyTarget::from(message.clone());
                     self.backend.send(Command::ReplyInteractive {
                         chat,
                         message,
                         button,
                         choice,
                     });
-                    self.follow_outgoing();
+                    self.follow_outgoing(Some(&quoted));
                 }
             }
             Action::CreatePoll { chat, draft } => {
@@ -7144,7 +7298,13 @@ impl App {
             Action::OpenFile(path) => {
                 if crate::safety::can_open_attachment(&path) && path.is_file() {
                     if let Err(error) = open::that_detached(&path) {
-                        self.toast_error(format!("Could not open the attachment: {error}"));
+                        log::warn!("could not open an attachment: {error}");
+                        self.toast_error_offering(
+                            crate::util::no_app_opens(&path),
+                            path.parent().map(|folder| {
+                                (crate::util::REVEAL, Action::OpenFolder(folder.to_owned()))
+                            }),
+                        );
                     }
                 } else {
                     self.toast("For safety, open this file yourself from its folder");
@@ -8036,15 +8196,29 @@ impl App {
                 });
             }
             Action::SendSticker(path) => {
+                let launch = crate::ui::picker::take_launch(ctx);
                 if let Some(chat) = self.open_chat.clone() {
                     let quoting = self.reply_to.take();
+                    let quoted = quoting.clone();
+                    // The sticker shows at the end of the chat at once,
+                    // flown there from its tile, until its message arrives.
+                    let upload = self.begin_upload(
+                        &chat,
+                        crate::model::UploadKind::Sticker,
+                        String::new(),
+                        Some(crate::model::UploadPreview::File(path.clone())),
+                    );
+                    if let Some(from) = launch {
+                        crate::ui::conversation::launch_sticker(ctx, upload, from);
+                    }
                     self.backend.send(Command::SendSticker {
                         chat,
                         path,
                         quoting,
+                        upload: Some(upload),
                     });
                     self.picker = None;
-                    self.follow_outgoing();
+                    self.follow_outgoing(quoted.as_ref());
                     self.refocus_composer(ctx);
                 }
             }
@@ -8061,9 +8235,10 @@ impl App {
                 if let Some(chat) = self.open_chat.clone() {
                     self.toast("Sending GIF…");
                     let quoting = self.reply_to.take();
+                    let quoted = quoting.clone();
                     self.backend.send(Command::SendGif { chat, gif, quoting });
                     self.picker = None;
-                    self.follow_outgoing();
+                    self.follow_outgoing(quoted.as_ref());
                     self.refocus_composer(ctx);
                 }
             }
@@ -8924,6 +9099,16 @@ impl App {
                         .send(Command::SetDownloadFolder(folder.clone()));
                 }
             }
+            Action::SetCacheAge(age) => {
+                self.settings.cache_age = age;
+                self.mark_settings_dirty();
+                self.last_cache_prune = None;
+            }
+            Action::SetCacheLimit(limit) => {
+                self.settings.cache_limit = limit;
+                self.mark_settings_dirty();
+                self.last_cache_prune = None;
+            }
             Action::SetMicrophone(device) => {
                 self.settings.microphone = device;
                 self.mark_settings_dirty();
@@ -9333,6 +9518,7 @@ impl App {
             kind: ToastKind::Info,
             created: Instant::now(),
             undo,
+            offer: None,
         });
         while self
             .toasts
@@ -9352,10 +9538,25 @@ impl App {
     }
 
     pub fn toast_error(&mut self, message: impl Into<String>) {
-        let message = message.into();
+        self.toast_error_offering(message, None);
+    }
+
+    /// An error toast with a button that offers a way on. A system's error
+    /// code is for the log: the toast says what happened in plain words.
+    pub fn toast_error_offering(
+        &mut self,
+        message: impl Into<String>,
+        offer: Option<(&'static str, Action)>,
+    ) {
+        let full = message.into();
+        let message = crate::util::without_error_codes(&full);
+        if message != full {
+            log::warn!("an operation failed: {full}");
+        } else {
+            log::warn!("an operation failed; details are shown in the window");
+        }
         let said = self.toast_said(&message);
         self.announcer.say(crate::announcer::Category::Error, said);
-        log::warn!("an operation failed; details are shown in the window");
         // Errors stay until dismissed: a repeat moves to the end instead of
         // stacking, and only the newest few are kept.
         self.toasts
@@ -9379,6 +9580,7 @@ impl App {
             kind: ToastKind::Error,
             created: Instant::now(),
             undo: Vec::new(),
+            offer,
         });
     }
 
@@ -10205,12 +10407,13 @@ impl App {
                     return;
                 };
                 let quoting = self.reply_to.take();
+                let quoted = quoting.clone();
                 self.backend.send(Command::SendVoice {
                     chat,
                     samples,
                     quoting,
                 });
-                self.follow_outgoing();
+                self.follow_outgoing(quoted.as_ref());
             }
             return;
         };
@@ -10234,12 +10437,13 @@ impl App {
                     return;
                 }
                 let quoting = self.reply_to.take();
+                let quoted = quoting.clone();
                 self.backend.send(Command::SendVoice {
                     chat,
                     samples,
                     quoting,
                 });
-                self.follow_sent_chat();
+                self.follow_outgoing(quoted.as_ref());
             }
             Err(error) => self.recording_failed(&error),
         }
@@ -10306,6 +10510,10 @@ impl App {
         // The key went down or up this frame: the call hears it now, not on
         // the next event.
         self.sync_push_to_talk();
+        // Menus and dialogs that closed this frame leave as they came.
+        crate::ui::closing::paint(ctx);
+        // A sticker just sent flies from the picker over the closing copy.
+        crate::ui::conversation::paint_sticker_flights(ctx);
         // The old colours, if a change is being revealed, go over everything.
         self.theme_transition.paint(ctx);
         self.theme_reveal.paint(ctx);
@@ -11349,6 +11557,48 @@ mod tests {
     fn app() -> App {
         let root = std::env::temp_dir().join(format!("zapfast-app-{}", std::process::id()));
         App::headless(AppDirs::under(&root), Settings::default()).0
+    }
+
+    /// A contact who types a letter, stops, and types again pauses between
+    /// each: the dots hold through the pauses instead of flickering, and go
+    /// at once when the message arrives.
+    #[test]
+    fn typing_dots_hold_through_short_pauses() {
+        let mut app = app();
+        let chat = "15550001111@s.whatsapp.net";
+        let typing = |app: &mut App, composing: bool| {
+            app.apply_backend_event(
+                Event::Typing {
+                    chat: chat.into(),
+                    sender: chat.into(),
+                    composing,
+                },
+                true,
+            );
+        };
+        typing(&mut app, true);
+        typing(&mut app, false);
+        assert_eq!(app.typing_in(chat).len(), 1, "a pause keeps the dots");
+        let since = app.typing[chat][0].1;
+        let left = TYPING_TIMEOUT.saturating_sub(since.elapsed());
+        assert!(left <= TYPING_HOLD, "for a moment only: {left:?}");
+        typing(&mut app, true);
+        assert!(app.typing[chat][0].1.elapsed() < Duration::from_secs(1));
+        typing(&mut app, false);
+        app.apply_backend_event(
+            Event::Incoming {
+                chat: chat.into(),
+                message: Box::new(message(chat, "hello", 1)),
+            },
+            true,
+        );
+        assert!(
+            app.typing_in(chat).is_empty(),
+            "the message ends the typing"
+        );
+        // A pause from someone not shown typing shows nothing.
+        typing(&mut app, false);
+        assert!(app.typing_in(chat).is_empty());
     }
 
     /// While recording, the light, the timer and the waveform ask for a
@@ -18878,6 +19128,80 @@ mod tests {
         assert!(app.at_bottom);
     }
 
+    /// A reply to one of the 25 newest messages eases down to the end. A
+    /// reply to anything older, a plain send, or an arrival keeps the place
+    /// of a reader scrolled up even a few messages; at the end they follow.
+    #[test]
+    fn only_the_end_or_a_recent_reply_follows() {
+        let mut app = app();
+        let (backend, _commands, events) = Backend::recording_with_events();
+        app.backend = backend;
+        let ctx = egui::Context::default();
+        let chat = "fixture@s.whatsapp.net";
+        app.open_chat = Some(chat.into());
+        app.at_bottom = false;
+        app.scroll_to_bottom = false;
+        let mut conversation = Conversation::default();
+        for index in 0..200 {
+            conversation
+                .messages
+                .push(message(chat, &format!("m{index}"), index));
+        }
+        conversation.complete = true;
+        app.conversations.insert(chat.into(), conversation);
+        let send = |app: &mut App, quoting: Option<&str>| {
+            app.scroll_page = None;
+            app.apply(
+                Action::SendText {
+                    chat: chat.into(),
+                    text: "Reply fixture".into(),
+                    quoting: quoting.map(Into::into),
+                },
+                &ctx,
+            );
+            app.scroll_page
+        };
+
+        assert_eq!(
+            send(&mut app, Some("m189")),
+            Some(Scroll::Bottom),
+            "a reply to a recent message eases to the end"
+        );
+        assert_eq!(
+            send(&mut app, Some("m170")),
+            None,
+            "a reply beyond the 25 newest keeps the reader's place"
+        );
+        assert_eq!(
+            send(&mut app, Some("missing")),
+            None,
+            "a reply to a message not loaded keeps the reader's place"
+        );
+        assert_eq!(send(&mut app, None), None, "a send from above stays put");
+        assert!(!app.scroll_to_bottom);
+
+        let arrive = |app: &mut App, id: &str| {
+            app.scroll_page = None;
+            app.scroll_to_bottom = false;
+            events
+                .send(Event::Messages {
+                    chat: chat.into(),
+                    messages: vec![message(chat, id, 1_000)],
+                    older: false,
+                    complete: true,
+                })
+                .unwrap();
+            app.handle_events();
+            app.scroll_page.is_some() || app.scroll_to_bottom
+        };
+        assert!(
+            !arrive(&mut app, "new-1"),
+            "a reader scrolled up is not pulled away"
+        );
+        app.at_bottom = true;
+        assert!(arrive(&mut app, "new-2"), "a reader at the end follows");
+    }
+
     #[test]
     fn a_refused_text_for_another_chat_becomes_its_draft() {
         let root = tempfile::tempdir().unwrap();
@@ -20132,6 +20456,33 @@ mod tests {
                 ..
             }) if chat == "fixture@s.whatsapp.net" && id.id == "quoted-message"
         ));
+    }
+
+    #[test]
+    fn a_sent_sticker_shows_at_once_and_flies_from_its_tile() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        app.open_chat = Some("fixture@s.whatsapp.net".into());
+        let ctx = egui::Context::default();
+        let tile = egui::Rect::from_min_size(egui::pos2(40.0, 300.0), egui::Vec2::splat(80.0));
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("sticker-launch"), tile));
+
+        app.apply(
+            Action::SendSticker(std::path::PathBuf::from("sticker.webp")),
+            &ctx,
+        );
+
+        let [upload] = app.uploads.as_slice() else {
+            panic!("one upload expected");
+        };
+        assert_eq!(upload.kind, crate::model::UploadKind::Sticker);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::SendSticker { upload: Some(id), .. }) if id == upload.id
+        ));
+        // The tile is used once.
+        assert!(crate::ui::picker::take_launch(&ctx).is_none());
     }
 
     /// Checks that oversized attachment clicks are refused before a download command is queued.

@@ -1478,7 +1478,7 @@ impl Archive {
         // address, and the reading stops at the newest `limit` of those, so
         // text such as "http://x" never takes the place of an older link.
         let sql = format!(
-            "SELECT {BARE_COLUMNS}
+            "SELECT {SEARCH_COLUMNS}
              FROM messages
              WHERE chat = ?1 AND json_valid(content)
                AND json_extract(content, '$.kind') = 'text'
@@ -1491,8 +1491,19 @@ impl Archive {
         let mut statement = self.connection.prepare(&sql)?;
         let mut links = 0;
         for row in statement.query_map(params![chat], searched_message)? {
-            let row = row?;
+            let mut row = row?;
             if !row.content.web_links().is_empty() {
+                // A preview's picture is what the Links tab draws; the blob
+                // a text row without a preview holds is not.
+                if !matches!(
+                    row.content,
+                    Content::Text {
+                        preview: Some(_),
+                        ..
+                    }
+                ) {
+                    row.thumbnail = None;
+                }
                 rows.push(row);
                 links += 1;
                 if links == limit {
@@ -5993,10 +6004,19 @@ mod media_path_tests {
         }
         let ids = |rows: Vec<Message>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
         let rows = archive.media_docs_links(chat, 10).expect("rows");
-        // Only pictures and videos keep their preview blob: the panel draws
-        // those, and never the previews of documents and links.
+        // Only pictures, videos and a link's preview keep their preview
+        // blob: the panel draws those, and never the previews of documents or
+        // of links without a preview.
         for row in &rows {
-            let drawn = matches!(row.content, Content::Image { .. } | Content::Video { .. });
+            let drawn = matches!(
+                row.content,
+                Content::Image { .. }
+                    | Content::Video { .. }
+                    | Content::Text {
+                        preview: Some(_),
+                        ..
+                    }
+            );
             assert_eq!(row.thumbnail.is_some(), drawn, "{}", row.id);
         }
         assert_eq!(ids(rows), ["preview", "clip", "link", "doc", "photo"]);

@@ -11,12 +11,16 @@
 //! `fade`, so the messages do not stop at a line. Callers keep it within
 //! the header, as macOS does.
 //!
+//! The chat list's header frosts progressively ([`progressive`]): deeply
+//! behind the title, search and filters, so nothing under them can be read,
+//! then more lightly through the tail below, then sharp.
+//!
 //! Menus frost more deeply ([`rounded`]): a smaller copy, blurred more
 //! times, written back only within the menu's rounded corners. The work is
 //! done on frames that paint, and egui paints only when something changes,
 //! so an idle window spends nothing on it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use eframe::egui_glow;
 use eframe::glow::{self, HasContext};
@@ -26,12 +30,21 @@ use eframe::glow::{self, HasContext};
 const BAR: Strength = Strength {
     downscale: 2,
     passes: 1,
+    progressive: false,
 };
 /// How deeply a menu frosts: a quarter-size copy blurred three times, so
 /// only the colours of what lies under it come through, as iOS's do.
 const MENU: Strength = Strength {
     downscale: 4,
     passes: 3,
+    progressive: false,
+};
+/// How the chat list's header frosts: as deeply as a menu behind the
+/// header, easing through the copy after one pass to sharp below it.
+const PROGRESSIVE: Strength = Strength {
+    downscale: 4,
+    passes: 3,
+    progressive: true,
 };
 /// Sets of render targets kept, one for each size frosted in a frame (the
 /// header, the composer, a menu), so none is reallocated every frame.
@@ -46,6 +59,9 @@ struct Strength {
     downscale: i32,
     /// Horizontal and vertical passes over the small copy. Each widens the blur.
     passes: usize,
+    /// Whether the copy after the first pass is kept, for the lighter blur
+    /// a progressive frost eases through on its way to sharp.
+    progressive: bool,
 }
 
 /// A paint callback that frosts `rect`, the bottom `fade` points easing from
@@ -53,6 +69,12 @@ struct Strength {
 /// rounded by `radius` points, the card's it lies across.
 pub fn shape(rect: egui::Rect, fade: f32, radius: f32) -> egui::Shape {
     frost(rect, fade, radius, BAR)
+}
+
+/// A paint callback that frosts `rect` progressively: as deeply as a menu
+/// down to the bottom `fade` points, then through a lighter blur to sharp.
+pub fn progressive(rect: egui::Rect, fade: f32) -> egui::Shape {
+    frost(rect, fade, 0.0, PROGRESSIVE)
 }
 
 /// A paint callback that frosts `rect` deeply, as under a menu, within
@@ -75,13 +97,12 @@ fn frost(rect: egui::Rect, fade: f32, radius: f32, strength: Strength) -> egui::
             let mut glass = GLASS.lock().unwrap_or_else(|p| p.into_inner());
             // A window made anew has a new context; the old one took its
             // objects with it. A context that cannot frost is asked once.
-            let context = Arc::as_ptr(gl) as usize;
             if glass
                 .as_ref()
-                .is_none_or(|(made_for, _)| *made_for != context)
+                .is_none_or(|(made_for, _)| !made_for_this(made_for, gl))
             {
                 // SAFETY: called on the painting thread with its context current.
-                *glass = Some((context, unsafe { Glass::new(gl) }));
+                *glass = Some((Arc::downgrade(gl), unsafe { Glass::new(gl) }));
             }
             if let Some((_, Some(glass))) = glass.as_mut() {
                 // SAFETY: as above.
@@ -93,7 +114,16 @@ fn frost(rect: egui::Rect, fade: f32, radius: f32, strength: Strength) -> egui::
 
 /// The objects for the current context, keyed by it, or nothing where it
 /// cannot run them.
-static GLASS: Mutex<Option<(usize, Option<Glass>)>> = Mutex::new(None);
+static GLASS: Mutex<Option<(Weak<glow::Context>, Option<Glass>)>> = Mutex::new(None);
+
+/// Whether the objects made for `made_for` belong to `context`. The weak
+/// reference keeps the old context's allocation, so a context made after it
+/// closes cannot take its address. A bare address often went to the next
+/// window's context, and the stale object names then drew over that
+/// window's own textures, garbling it after a close and reopen.
+fn made_for_this<T>(made_for: &Weak<T>, context: &Arc<T>) -> bool {
+    std::ptr::eq(made_for.as_ptr(), Arc::as_ptr(context))
+}
 
 /// The two programs, and the render targets for each size frosted lately.
 struct Glass {
@@ -105,10 +135,11 @@ struct Glass {
     clock: u64,
 }
 
-/// One full-size and two small render targets.
+/// One full-size and three small render targets: two to blur between, and
+/// the lighter blur a progressive frost keeps.
 struct Targets {
     sharp: Target,
-    small: [Target; 2],
+    small: [Target; 3],
     used: u64,
 }
 
@@ -145,20 +176,29 @@ void main() {
 const COMPOSE: &str = r"
 uniform sampler2D u_sharp;
 uniform sampler2D u_blur;
+uniform sampler2D u_light;
 uniform float u_fade;
 uniform float u_saturation;
 uniform vec2 u_size;
 uniform float u_radius;
 in vec2 v_uv;
 out vec4 o_color;
-void main() {
-    vec4 blur = texture(u_blur, v_uv);
+vec4 saturate(vec4 blur) {
     float luma = dot(blur.rgb, vec3(0.2126, 0.7152, 0.0722));
     // Colours are premultiplied, so they stay within their alpha.
     blur.rgb = clamp(mix(vec3(luma), blur.rgb, u_saturation), 0.0, blur.a);
+    return blur;
+}
+void main() {
     // A negative fade eases towards the top instead, for a bar at the bottom.
     float edge = u_fade < 0.0 ? 1.0 - v_uv.y : v_uv.y;
     float frost = u_fade != 0.0 ? smoothstep(0.0, abs(u_fade), edge) : 1.0;
+    // Where both blurs are the same texture this mix changes nothing; a
+    // progressive frost is light at the bottom of its fade and deep from
+    // just past its top.
+    float fade = abs(u_fade);
+    float deep = u_fade != 0.0 ? smoothstep(fade * 0.3, min(fade * 1.25, 1.0), edge) : 1.0;
+    vec4 blur = saturate(mix(texture(u_light, v_uv), texture(u_blur, v_uv), deep));
     // Outside rounded corners what is there stays, antialiased at the edge.
     vec2 half_size = u_size * 0.5;
     vec2 q = abs(v_uv * u_size - half_size) - (half_size - vec2(u_radius));
@@ -203,7 +243,7 @@ impl Glass {
                 let set = unsafe {
                     Targets {
                         sharp: Target::new(gl)?,
-                        small: [Target::new(gl)?, Target::new(gl)?],
+                        small: [Target::new(gl)?, Target::new(gl)?, Target::new(gl)?],
                         used: 0,
                     }
                 };
@@ -248,7 +288,8 @@ impl Glass {
             };
             let screen = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
             set.sharp.resize(gl, (w, h));
-            for target in &mut set.small {
+            let kept = if strength.progressive { 3 } else { 2 };
+            for target in &mut set.small[..kept] {
                 target.resize(gl, small);
             }
             gl.disable(glow::SCISSOR_TEST);
@@ -276,7 +317,23 @@ impl Glass {
             gl.uniform_1_i32(gl.get_uniform_location(blur, "u_texture").as_ref(), 0);
             let step = gl.get_uniform_location(blur, "u_step");
             gl.viewport(0, 0, small.0, small.1);
-            for _ in 0..strength.passes {
+            for pass in 0..strength.passes {
+                if pass == 1 && strength.progressive {
+                    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(set.small[0].framebuffer));
+                    gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(set.small[2].framebuffer));
+                    gl.blit_framebuffer(
+                        0,
+                        0,
+                        small.0,
+                        small.1,
+                        0,
+                        0,
+                        small.0,
+                        small.1,
+                        glow::COLOR_BUFFER_BIT,
+                        glow::NEAREST,
+                    );
+                }
                 for (from, to, direction) in [(0, 1, (1.0, 0.0)), (1, 0, (0.0, 1.0))] {
                     gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(set.small[to].framebuffer));
                     gl.bind_texture(glow::TEXTURE_2D, Some(set.small[from].texture));
@@ -303,14 +360,25 @@ impl Glass {
             gl.bind_texture(glow::TEXTURE_2D, Some(set.sharp.texture));
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, Some(set.small[0].texture));
+            // Without a lighter copy kept, the deep blur stands in for it.
+            let light = if strength.progressive && strength.passes > 1 {
+                2
+            } else {
+                0
+            };
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, Some(set.small[light].texture));
             let uniform = |name| gl.get_uniform_location(compose, name);
             gl.uniform_1_i32(uniform("u_sharp").as_ref(), 0);
             gl.uniform_1_i32(uniform("u_blur").as_ref(), 1);
+            gl.uniform_1_i32(uniform("u_light").as_ref(), 2);
             gl.uniform_1_f32(uniform("u_fade").as_ref(), fade as f32 / h as f32);
             gl.uniform_1_f32(uniform("u_saturation").as_ref(), SATURATION);
             gl.uniform_2_f32(uniform("u_size").as_ref(), w as f32, h as f32);
             gl.uniform_1_f32(uniform("u_radius").as_ref(), radius);
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, None);
@@ -406,5 +474,24 @@ unsafe fn program(gl: &glow::Context, header: &str, fragment: &str) -> Option<gl
             return None;
         }
         Some(program)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A context made after the old one closes is never taken for it, even
+    /// where the allocator would hand the new one the old address.
+    #[test]
+    fn a_reopened_window_gets_new_objects() {
+        let first = Arc::new([0u8; 64]);
+        let made_for = Arc::downgrade(&first);
+        assert!(made_for_this(&made_for, &first));
+        drop(first);
+        for _ in 0..64 {
+            let next = Arc::new([0u8; 64]);
+            assert!(!made_for_this(&made_for, &next));
+        }
     }
 }

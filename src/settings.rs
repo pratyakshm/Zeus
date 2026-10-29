@@ -221,6 +221,83 @@ impl DoodleColor {
 /// How much of the default doodle strength the slider scales it by.
 pub const DOODLE_INTENSITY: std::ops::RangeInclusive<f32> = 0.2..=2.5;
 
+/// How long a downloaded attachment stays in the media cache without being
+/// opened before it is deleted on its own. It downloads again when opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheAge {
+    OneMonth,
+    ThreeMonths,
+    OneYear,
+    #[default]
+    Never,
+}
+
+impl CacheAge {
+    pub const ALL: [Self; 4] = [
+        Self::OneMonth,
+        Self::ThreeMonths,
+        Self::OneYear,
+        Self::Never,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OneMonth => "After 1 month",
+            Self::ThreeMonths => "After 3 months",
+            Self::OneYear => "After 1 year",
+            Self::Never => "Never",
+        }
+    }
+
+    /// The age past which a file goes, `None` for never.
+    pub fn max_age(self) -> Option<std::time::Duration> {
+        const DAY: u64 = 24 * 60 * 60;
+        match self {
+            Self::OneMonth => Some(std::time::Duration::from_secs(30 * DAY)),
+            Self::ThreeMonths => Some(std::time::Duration::from_secs(91 * DAY)),
+            Self::OneYear => Some(std::time::Duration::from_secs(365 * DAY)),
+            Self::Never => None,
+        }
+    }
+}
+
+/// The most the media cache may hold. Past it, the attachments opened
+/// longest ago are deleted until it fits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheLimit {
+    OneGb,
+    FiveGb,
+    TenGb,
+    #[default]
+    NoLimit,
+}
+
+impl CacheLimit {
+    pub const ALL: [Self; 4] = [Self::OneGb, Self::FiveGb, Self::TenGb, Self::NoLimit];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OneGb => "1 GB",
+            Self::FiveGb => "5 GB",
+            Self::TenGb => "10 GB",
+            Self::NoLimit => "No limit",
+        }
+    }
+
+    /// The limit in bytes, `None` for none.
+    pub fn max_bytes(self) -> Option<u64> {
+        const GB: u64 = 1_000_000_000;
+        match self {
+            Self::OneGb => Some(GB),
+            Self::FiveGb => Some(5 * GB),
+            Self::TenGb => Some(10 * GB),
+            Self::NoLimit => None,
+        }
+    }
+}
+
 /// Background colours offered by WhatsApp's wallpaper picker, after the
 /// active theme's own chat colour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -736,8 +813,12 @@ pub struct Settings {
     /// The ready-made theme last used, to return to from Custom.
     pub last_theme: ChatTheme,
     /// Frosted glass under the header and composer, and the desktop through
-    /// the window where the platform offers it, for themes that draw glass.
+    /// the window where the platform offers it, for themes that draw glass:
+    /// Glass short of Solid. Kept in step with `glass` by
+    /// [`Settings::set_glass`], for releases that only know this switch.
     pub blur: bool,
+    /// How tinted glass is, from 0 (Clear) to 1 (Solid, as Blur off was).
+    pub glass: f32,
     /// Whether every bubble shows its time and ticks inside it. Zeus's own
     /// look otherwise shows them below the bubble on a click.
     pub always_show_time: bool,
@@ -839,6 +920,10 @@ pub struct Settings {
     /// Folder for new downloads. `None` keeps them in the cache. Files
     /// already downloaded stay where they are when this changes.
     pub download_folder: Option<std::path::PathBuf>,
+    /// When unopened attachments leave the media cache on their own.
+    pub cache_age: CacheAge,
+    /// How big the media cache may grow before old attachments leave it.
+    pub cache_limit: CacheLimit,
     /// Archived chats stay archived when a message arrives or is sent, as
     /// with the phone's "Keep chats archived". Off, a new message brings the
     /// chat back to the list.
@@ -914,6 +999,7 @@ impl Default for Settings {
             last_look: ChatTheme::WhatsApp,
             last_theme: ChatTheme::Catppuccin,
             blur: true,
+            glass: crate::backdrop::GLASS_DEFAULT,
             always_show_time: false,
             messages_theme: false,
             font: FontChoice::GoogleSansFlex,
@@ -952,6 +1038,8 @@ impl Default for Settings {
             group_sounds: true,
             notification_cooldown: true,
             download_folder: None,
+            cache_age: CacheAge::default(),
+            cache_limit: CacheLimit::default(),
             keep_chats_archived: true,
             proxy: String::new(),
             check_for_updates: true,
@@ -986,7 +1074,11 @@ impl Default for Settings {
 ///    mode) become [`WallpaperColor::Theme`], the new default.
 /// 2. The one theme menu becomes a chat theme, a mode and an accent
 ///    ([`Settings::set_theme`]).
-pub const SETTINGS_VERSION: u32 = 2;
+/// 3. Turned the Halloween look on. The look is gone, so nothing is left to
+///    do.
+/// 4. Blur's switch becomes Glass ([`Settings::glass`]): Off is its Solid
+///    end.
+pub const SETTINGS_VERSION: u32 = 4;
 
 /// The key push to talk starts on.
 pub const DEFAULT_PUSH_TO_TALK_KEY: &str = "Space";
@@ -1121,6 +1213,22 @@ impl Settings {
     pub fn palette(&self, dark: bool) -> crate::theme::Palette {
         self.cached_palette()
             .unwrap_or_else(|| self.chat_theme.palette(dark, self.accent))
+    }
+
+    /// Sets Glass, and Blur with it for older releases: on short of Solid.
+    pub fn set_glass(&mut self, tint: f32) {
+        self.glass = tint.clamp(0.0, 1.0);
+        self.blur = self.glass < 1.0;
+    }
+
+    /// Glass as the window draws it: Solid while the system asks for less
+    /// transparency.
+    pub fn glass_shown(&self) -> f32 {
+        if !self.blur || crate::backdrop::system_reduces_transparency() {
+            1.0
+        } else {
+            self.glass
+        }
     }
 
     /// Whether the window should let the desktop show through it.
@@ -1263,6 +1371,14 @@ impl Settings {
         }
         if self.version < 2 {
             self.set_theme(self.legacy_theme);
+        }
+        if self.version < 4 {
+            // Blur's switch became Glass: Off is its Solid end.
+            self.glass = if self.blur {
+                crate::backdrop::GLASS_DEFAULT
+            } else {
+                1.0
+            };
         }
         self.version = self.version.max(SETTINGS_VERSION);
     }
@@ -1643,6 +1759,20 @@ mod tests {
         assert_eq!(loaded.mode, Mode::Light);
         assert!(!loaded.blur);
         assert!(!loaded.vibrant_window());
+    }
+
+    #[test]
+    fn blur_off_becomes_solid_glass() {
+        let (off, _) = load_from(r#"{"version":3,"blur":false}"#);
+        assert_eq!(off.glass, 1.0);
+        assert_eq!(off.glass_shown(), 1.0);
+        let (on, _) = load_from(r#"{"version":3,"blur":true}"#);
+        assert_eq!(on.glass, crate::backdrop::GLASS_DEFAULT);
+        let mut chosen = on.clone();
+        chosen.set_glass(1.0);
+        assert!(!chosen.blur, "older releases read Solid as Blur off");
+        chosen.set_glass(0.0);
+        assert!(chosen.blur);
     }
 
     #[test]

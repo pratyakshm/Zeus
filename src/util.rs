@@ -529,6 +529,45 @@ pub fn search_key(text: &str) -> String {
         .collect()
 }
 
+/// The fewest letters of a search a loose match is allowed for: two letters
+/// are a subsequence of too many names to mean anything.
+const FUZZY_MIN_LETTERS: usize = 3;
+
+/// Whether the search key `needle` loosely matches the search key `text`: its
+/// letters follow one another in `text`, with no more than a letter's gap on
+/// average between them, so "jhn" finds "john" and "mkt plc" "Market Place"
+/// but "jhn" does not find a name that merely holds a j, an h and an n far
+/// apart. A search that `text` contains outright matches too.
+pub fn fuzzy_matches(text: &str, needle: &str) -> bool {
+    if text.contains(needle) {
+        return true;
+    }
+    let needle: Vec<char> = needle.chars().filter(|c| !c.is_whitespace()).collect();
+    if needle.len() < FUZZY_MIN_LETTERS {
+        return false;
+    }
+    let text: Vec<char> = text.chars().collect();
+    let reach = needle.len() * 2;
+    (0..text.len())
+        .filter(|&start| text[start] == needle[0])
+        .any(|start| {
+            let mut next = 1;
+            for (offset, letter) in text[start + 1..].iter().enumerate() {
+                // `offset + 2` letters of `text` are spanned so far.
+                if offset + 2 > reach {
+                    break;
+                }
+                if *letter == needle[next] {
+                    next += 1;
+                    if next == needle.len() {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+}
+
 /// Duration such as "0:12".
 pub fn duration(seconds: u32) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
@@ -550,21 +589,85 @@ pub fn bytes(size: u64) -> String {
     }
 }
 
-/// Up to two initials for a fallback avatar.
+/// The button that shows a file in the system's file manager.
+pub const REVEAL: &str = if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else if cfg!(windows) {
+    "Show in File Explorer"
+} else {
+    "Show in folder"
+};
+
+/// What to say when no application opens `path`, in plain words: "No app
+/// on this Mac opens PDF files." The system's own message and code go to
+/// the log.
+pub fn no_app_opens(path: &std::path::Path) -> String {
+    let device = if cfg!(target_os = "macos") {
+        "Mac"
+    } else if cfg!(windows) {
+        "PC"
+    } else {
+        "computer"
+    };
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty() && extension.len() <= 8)
+    {
+        Some(extension) => format!(
+            "No app on this {device} opens {} files.",
+            extension.to_uppercase()
+        ),
+        None => format!("No app on this {device} opens this file."),
+    }
+}
+
+/// `message` without the error codes systems add for developers, as
+/// "(error -10814)" or "(os error 2)": those belong in the log.
+pub fn without_error_codes(message: &str) -> String {
+    fn is_code(inner: &str) -> bool {
+        let inner = inner.trim().to_lowercase();
+        let rest = inner
+            .strip_prefix("os error")
+            .or_else(|| inner.strip_prefix("error"))
+            .or_else(|| inner.strip_prefix("code"))
+            .unwrap_or(&inner)
+            .trim_start_matches([':', ' ', '=']);
+        let digits = rest.strip_prefix('-').unwrap_or(rest);
+        !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
+    }
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(open) = rest.find('(') {
+        let Some(close) = rest[open..].find(')') else {
+            break;
+        };
+        let (before, inner) = (&rest[..open], &rest[open + 1..open + close]);
+        if is_code(inner) {
+            out.push_str(before.trim_end());
+        } else {
+            out.push_str(&rest[..=open + close]);
+        }
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Up to two initials for a fallback avatar: letters only, so an unsaved
+/// contact named by a phone number has none, and the avatar draws a person
+/// instead of the number's digits (#27).
 pub fn initials(name: &str) -> String {
     let mut words = name
         .split(|character: char| character.is_whitespace() || character == '-')
-        .filter(|word| word.chars().any(char::is_alphanumeric));
+        .filter(|word| word.chars().any(char::is_alphabetic));
     let first = words.next();
     let last = words.next_back();
     let mut initials = String::new();
     for word in [first, last].into_iter().flatten() {
-        if let Some(character) = word.chars().find(|character| character.is_alphanumeric()) {
+        if let Some(character) = word.chars().find(|character| character.is_alphabetic()) {
             initials.extend(character.to_uppercase());
         }
-    }
-    if initials.is_empty() {
-        initials.push('#');
     }
     initials
 }
@@ -815,6 +918,31 @@ pub fn tray_template_rgba(size: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_loose_search_finds_names_with_letters_left_out() {
+        use super::fuzzy_matches as loose;
+        assert!(loose("john smith", "jhn"));
+        assert!(loose("john smith", "jo sm"));
+        assert!(loose("market place", "mkt plc"));
+        assert!(
+            loose("john smith", "smith"),
+            "an exact search still matches"
+        );
+        assert!(loose("ab", "ab"), "even one too short to be loose");
+    }
+
+    #[test]
+    fn a_loose_search_does_not_match_scattered_letters() {
+        use super::fuzzy_matches as loose;
+        assert!(!loose("jack the harbour inn", "jhn"));
+        assert!(!loose("john smith", "xyz"));
+        assert!(!loose("john smith", "nj"), "letters out of order");
+        assert!(
+            !loose("john smith", "jh"),
+            "two letters are not enough to guess"
+        );
+    }
+
+    #[test]
     fn a_call_length_reads_the_way_the_phone_shows_it() {
         assert_eq!(super::call_duration(0), "0:00");
         assert_eq!(super::call_duration(65), "1:05");
@@ -985,8 +1113,43 @@ mod tests {
     fn initials_take_first_and_last_word() {
         assert_eq!(initials("Ada Lovelace"), "AL");
         assert_eq!(initials("ada"), "A");
-        assert_eq!(initials("  "), "#");
+        assert_eq!(initials("  "), "");
         assert_eq!(initials("🎉 Party Planning"), "PP");
+        assert_eq!(initials("Room 101"), "R");
+    }
+
+    #[test]
+    fn a_phone_number_has_no_initials() {
+        assert_eq!(initials("+91 98765 43210"), "");
+        assert_eq!(initials("+55 (11) 99999-9999"), "");
+    }
+
+    #[test]
+    fn error_codes_go_to_the_log() {
+        assert_eq!(
+            without_error_codes("The file couldn't be opened (error -10814)."),
+            "The file couldn't be opened."
+        );
+        assert_eq!(
+            without_error_codes("No such file or directory (os error 2)"),
+            "No such file or directory"
+        );
+        assert_eq!(
+            without_error_codes("Sent to Ada (work) at noon"),
+            "Sent to Ada (work) at noon"
+        );
+        assert_eq!(
+            without_error_codes("Unclosed (error -1"),
+            "Unclosed (error -1"
+        );
+    }
+
+    #[test]
+    fn a_file_no_app_opens_is_named_by_its_kind() {
+        let said = no_app_opens(std::path::Path::new("/tmp/report.pdf"));
+        assert!(said.starts_with("No app on this "), "{said}");
+        assert!(said.ends_with(" opens PDF files."), "{said}");
+        assert!(no_app_opens(std::path::Path::new("/tmp/README")).ends_with(" opens this file."));
     }
 
     #[test]

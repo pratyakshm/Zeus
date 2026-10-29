@@ -507,6 +507,8 @@ pub enum Command {
         chat: ChatId,
         path: PathBuf,
         quoting: Option<crate::model::ReplyTarget>,
+        /// The interface's name for the sticker while it goes.
+        upload: Option<crate::model::UploadId>,
     },
     /// Saves a sticker file.
     SaveSticker {
@@ -924,6 +926,16 @@ pub enum Command {
         query: String,
         results: Result<Vec<Gif>, GifError>,
     },
+    /// Deletes the attachments in this account's media cache not opened
+    /// within `max_age`, then the ones opened longest ago until the cache
+    /// holds no more than `max_bytes`. Answered by `Event::MediaPruned` when
+    /// anything went.
+    PruneMediaCache {
+        max_age: Option<std::time::Duration>,
+        max_bytes: Option<u64>,
+    },
+    /// Internal: the files a prune made off the runtime deleted.
+    MediaPruned(Vec<PathBuf>),
     /// Measures this account's media cache for Settings, answered by
     /// `Event::StorageStats` with the same `token`.
     LoadStorageStats {
@@ -1191,6 +1203,9 @@ pub enum Event {
         token: u64,
         cleared: bool,
     },
+    /// Attachments the automatic cleanup deleted from the media cache, so
+    /// the interface stops pointing at them.
+    MediaPruned(Vec<PathBuf>),
     /// Files selected for the composer, to go as documents when `documents`.
     Picked {
         chat: ChatId,

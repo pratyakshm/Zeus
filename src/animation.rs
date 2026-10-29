@@ -22,17 +22,40 @@ const MAX_FRAMES: usize = 150;
 const IDLE: Duration = Duration::from_secs(20);
 /// Maximum concurrent decoders.
 const MAX_DECODERS: usize = 2;
+/// How long a decoder holds its slot. One still running after this, stuck
+/// on a broken file, no longer keeps other animations from decoding.
+const DECODE_DEADLINE: Duration = Duration::from_secs(10);
 /// Global texture-frame budget. Least-recently-used animations are removed first.
 const MAX_RESIDENT_FRAMES: usize = 450;
 
-static DECODING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The decoders holding a slot, by number, and when each started.
+static DECODING: Mutex<Vec<(u64, Instant)>> = Mutex::new(Vec::new());
+static NEXT_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Guard for one decoder slot.
-struct DecodeSlot;
+struct DecodeSlot(u64);
+
+impl DecodeSlot {
+    /// Takes a slot when fewer than `MAX_DECODERS` decoders started within
+    /// the deadline.
+    fn take(now: Instant) -> Option<Self> {
+        let mut decoding = DECODING.lock().unwrap_or_else(|p| p.into_inner());
+        decoding.retain(|(_, started)| now.saturating_duration_since(*started) < DECODE_DEADLINE);
+        if decoding.len() >= MAX_DECODERS {
+            return None;
+        }
+        let id = NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        decoding.push((id, now));
+        Some(Self(id))
+    }
+}
 
 impl Drop for DecodeSlot {
     fn drop(&mut self) {
-        DECODING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        DECODING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(id, _)| *id != self.0);
     }
 }
 
@@ -342,11 +365,9 @@ enum Start {
 /// Decodes `path` on a thread, every frame when `all` and otherwise only the
 /// poster, and delivers the result to `inbox`.
 fn start_decode(ctx: &egui::Context, inbox: &Inbox, path: &Path, all: bool) -> Start {
-    if DECODING.load(std::sync::atomic::Ordering::Acquire) >= MAX_DECODERS {
+    let Some(slot) = DecodeSlot::take(Instant::now()) else {
         return Start::Busy;
-    }
-    DECODING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let slot = DecodeSlot;
+    };
     let file = path.to_path_buf();
     let ctx = ctx.clone();
     let inbox = inbox.clone();
@@ -455,8 +476,10 @@ fn decode_webp(path: &Path, limit: usize) -> Option<Decoded> {
         previous = i64::from(frame.timestamp());
         decoded.push((to_color_image(&image), Duration::from_millis(delay)));
     }
-    // Single-frame files use the static-image path.
-    if decoded.len() < 2 {
+    // Single-frame stills use the static-image path. A single frame in a file
+    // that says it moves, as many of WhatsApp's stickers do, is drawn as an
+    // animation, so it must give its picture.
+    if decoded.is_empty() || (decoded.len() < 2 && !webp_moves(&bytes[..bytes.len().min(64)])) {
         return None;
     }
     decoded.truncate(limit);
@@ -500,7 +523,7 @@ fn decode_mp4_from<R: std::io::Read + std::io::Seek>(
     size: u64,
     limit: usize,
 ) -> Option<Decoded> {
-    let mut mp4 = mp4::Mp4Reader::read_header(reader, size).ok()?;
+    let mut mp4 = crate::mp4_guard::read_header(reader, size).ok()?;
     let (track_id, timescale, sps, pps, count) = {
         let track = mp4
             .tracks()
@@ -569,7 +592,7 @@ pub(crate) struct Poster {
 /// Reads the size, length, and a poster frame of the MP4 in `bytes`.
 pub(crate) fn poster(bytes: &[u8]) -> Option<Poster> {
     let size = bytes.len() as u64;
-    let mp4 = mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).ok()?;
+    let mp4 = crate::mp4_guard::read_header(std::io::Cursor::new(bytes), size).ok()?;
     let track = mp4
         .tracks()
         .values()
@@ -891,6 +914,33 @@ mod tests {
         assert_eq!(decoded.frames.len(), 2);
         assert_eq!(decoded.frames[0].1, Duration::from_millis(100));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_mp4_with_a_box_of_size_zero_fails_instead_of_hanging() {
+        let bytes = crate::mp4_guard::tests::zero_size_box();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let size = bytes.len() as u64;
+            let decoded = decode_mp4_from(std::io::Cursor::new(&bytes), size, MAX_FRAMES);
+            let _ = sender.send((decoded.is_none(), poster(&bytes).is_none()));
+        });
+        let failed = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the decoder returns instead of hanging");
+        assert_eq!(failed, (true, true));
+    }
+
+    #[test]
+    fn a_stuck_decoder_gives_up_its_slot_after_the_deadline() {
+        // Far ahead of every other test's slots, which the deadline clears.
+        let start = Instant::now() + Duration::from_secs(3600);
+        let held: Vec<_> = (0..MAX_DECODERS)
+            .map_while(|_| DecodeSlot::take(start))
+            .collect();
+        assert_eq!(held.len(), MAX_DECODERS);
+        assert!(DecodeSlot::take(start + Duration::from_secs(1)).is_none());
+        assert!(DecodeSlot::take(start + DECODE_DEADLINE).is_some());
     }
 
     #[test]
@@ -1340,6 +1390,63 @@ mod tests {
         assert!(webp_moves(&bytes));
         let decoded = decode(&path, MAX_FRAMES).expect("decodes");
         assert_eq!(decoded.frames.len(), 3);
+    }
+
+    /// An animated WebP of one 8x8 frame, laid out as WhatsApp's stickers
+    /// often are (`VP8X`, `ANIM`, one `ANMF`). libwebp's encoder writes a
+    /// still for a single frame, so the chunks are put together here.
+    fn one_frame_animation(dir: &Path, name: &str) -> PathBuf {
+        let still = dir.join("still-frame.webp");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 40, 90, 255]))
+            .save(&still)
+            .expect("saves");
+        let bitstream = std::fs::read(&still).expect("reads")[12..].to_vec();
+        let chunk = |tag: &[u8], payload: &[u8]| {
+            let mut chunk = tag.to_vec();
+            chunk.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            chunk.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                chunk.push(0);
+            }
+            chunk
+        };
+        let side = [7u8, 0, 0];
+        let header = [&[0x12u8, 0, 0, 0][..], &side, &side].concat();
+        // Background colour and loop count.
+        let anim = [0u8; 6];
+        // Offset, size, 100 ms and no blending, then the frame itself.
+        let frame = [&[0u8; 6][..], &side, &side, &[100, 0, 0, 0], &bitstream].concat();
+        let body = [
+            &b"WEBP"[..],
+            &chunk(b"VP8X", &header),
+            &chunk(b"ANIM", &anim),
+            &chunk(b"ANMF", &frame),
+        ]
+        .concat();
+        let mut file = b"RIFF".to_vec();
+        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        file.extend_from_slice(&body);
+        let path = dir.join(name);
+        std::fs::write(&path, file).expect("writes");
+        path
+    }
+
+    /// A one-frame animation says it moves, so the sticker is drawn as an
+    /// animation; it must still give its picture rather than leave the
+    /// sticker's placeholder in the bubble.
+    #[test]
+    fn a_one_frame_animation_decodes_to_its_frame() {
+        let dir = std::env::temp_dir().join(format!("zapfast-one-frame-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = one_frame_animation(&dir, "one.webp");
+        let bytes = std::fs::read(&path).expect("reads");
+        assert!(webp_moves(&bytes[..bytes.len().min(64)]));
+        for limit in [1, MAX_FRAMES] {
+            let decoded = decode(&path, limit).expect("decodes");
+            assert_eq!(decoded.frames.len(), 1);
+            assert_eq!(decoded.frames[0].0.size, [8, 8]);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

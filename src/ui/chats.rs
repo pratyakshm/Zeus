@@ -27,10 +27,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             top: HEADER_DROP as i8,
             bottom: 0,
         }));
-    let response = panel.show(ui, |ui| {
-        header(app, ui);
-        body(app, ui);
-    });
+    let response = panel.show(ui, |ui| column(app, ui));
     let width = response.response.rect.width();
     ui.ctx()
         .data_mut(|data| data.insert_temp(panel_rect_id(), response.response.rect));
@@ -58,10 +55,7 @@ pub fn full_show(app: &mut App, ui: &mut egui::Ui) {
             top: HEADER_DROP as i8,
             bottom: 0,
         }))
-        .show(ui, |ui| {
-            header(app, ui);
-            body(app, ui);
-        });
+        .show(ui, |ui| column(app, ui));
 }
 
 /// The gutter between the window's edges and the floating conversation card.
@@ -72,6 +66,178 @@ pub(crate) const CARD_RADIUS: u8 = 24;
 /// header in the card beside it moves down as far, so the chat's name,
 /// picture and buttons sit on the same line as the list's title.
 pub(crate) const HEADER_DROP: f32 = 12.0;
+
+/// How far below the list's header its frost and veil carry on, easing off.
+const FROST_TAIL: f32 = 36.0;
+/// How far up into the header the frost's ease reaches, so it is all but
+/// full at the header's bottom edge and the lightest blur stays under it.
+const FROST_OVERLAP: f32 = 8.0;
+
+/// The list pane's header and the list under it. On a vibrant window the
+/// header goes on a layer above the list, which scrolls on under it through a
+/// frost that is strongest at the top and eases to sharp towards the bottom,
+/// as the conversation's header does over its messages.
+fn column(app: &mut App, ui: &mut egui::Ui) {
+    // A narrow window's slide draws copies of the list; they keep the plain
+    // header, so one layer is never drawn twice.
+    let copy = ui
+        .ctx()
+        .data(|data| data.get_temp::<bool>(slide_copy_id()))
+        .is_some();
+    if copy || !app.palette.vibrant() || !crate::backdrop::blur() {
+        header(app, ui);
+        body(app, ui);
+        return;
+    }
+    let area = ui.available_rect_before_wrap();
+    // The frost reaches up through the margin above the header, so the rows
+    // scrolling under it are not cut off at a line below the panel's top.
+    let top = area.top() - HEADER_DROP;
+    let layer = egui::LayerId::new(egui::Order::Middle, ui.id().with("chat-list-header"));
+    let reach_id = layer.id.with("reach");
+    ui.scope_builder(egui::UiBuilder::new().layer_id(layer), |ui| {
+        // A click in a gap of the header must not reach a row scrolled
+        // under it.
+        if let Some(last) = ui.ctx().data(|data| data.get_temp::<Rect>(reach_id)) {
+            ui.interact(last, reach_id, Sense::click_and_drag());
+        }
+        let glass = ui.painter().add(egui::Shape::Noop);
+        let veil = ui.painter().add(egui::Shape::Noop);
+        header(app, ui);
+        let bar = ui.min_rect();
+        let reach = Rect::from_x_y_ranges(area.x_range(), top..=bar.bottom());
+        // Fully frosted down to the filters, so no row under the header can
+        // be read, then easing off over the tail below them.
+        let frosted = reach.with_max_y(reach.bottom() + FROST_TAIL);
+        let ease = FROST_TAIL + FROST_OVERLAP;
+        ui.painter()
+            .set(glass, super::glass::progressive(frosted, ease));
+        ui.painter().set(
+            veil,
+            conversation::header_veil(
+                app.palette.vibrant_header(app.palette.rail()),
+                frosted,
+                ease,
+                0.0,
+            ),
+        );
+        ui.ctx().data_mut(|data| data.insert_temp(reach_id, reach));
+    });
+    // The list starts where the header's layer left the panel's cursor, and
+    // its scroll areas reach back up behind the header from there.
+    let inset = ui.available_rect_before_wrap().top() - top;
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(header_inset_id(), inset));
+    body(app, ui);
+    ui.ctx()
+        .data_mut(|data| data.remove::<f32>(header_inset_id()));
+}
+
+/// How far the list's scroll areas reach up under the frosted header while
+/// the body is drawn.
+fn header_inset_id() -> egui::Id {
+    egui::Id::new("chat-list-header-inset")
+}
+
+/// Runs `contents` in a rect that reaches up under the frosted header, given
+/// how far (nothing, where the header is not frosted): its scroll area starts
+/// with that much space, so the first row rests below the header and the rest
+/// scroll up under it.
+pub(super) fn under_header<R>(
+    ui: &mut egui::Ui,
+    contents: impl FnOnce(&mut egui::Ui, f32) -> R,
+) -> R {
+    let inset = ui
+        .ctx()
+        .data(|data| data.get_temp::<f32>(header_inset_id()))
+        .unwrap_or(0.0);
+    // The scroll bar's handle takes the accent; the rows put the plain
+    // colours back (see [`scroll_area`]).
+    let accent = ui.visuals().selection.stroke.color;
+    let plain = widget_visuals(ui.visuals_mut()).map(|widget| {
+        let color = widget.fg_stroke.color;
+        widget.fg_stroke.color = accent;
+        color
+    });
+    let inner = if inset <= 0.0 {
+        contents(ui, 0.0)
+    } else {
+        let mut rect = ui.available_rect_before_wrap();
+        rect.min.y -= inset;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            contents(ui, inset)
+        })
+        .inner
+    };
+    for (widget, color) in widget_visuals(ui.visuals_mut()).into_iter().zip(plain) {
+        widget.fg_stroke.color = color;
+    }
+    inner
+}
+
+/// The widget states egui paints a scroll bar's handle in.
+fn widget_visuals(visuals: &mut egui::Visuals) -> [&mut egui::style::WidgetVisuals; 3] {
+    let widgets = &mut visuals.widgets;
+    [
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+    ]
+}
+
+/// A vertical scroll area for a list drawn by [`under_header`]: its bar
+/// runs from the first row down, clear of the header, rather than from the
+/// panel's top.
+pub(super) fn scroll_area(ui: &egui::Ui, inset: f32) -> egui::ScrollArea {
+    let rect = ui.available_rect_before_wrap();
+    let top = (rect.top() + inset).min(rect.bottom());
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .scroll_bar_rect(Rect::from_x_y_ranges(rect.x_range(), top..=rect.bottom()))
+}
+
+/// Puts back, inside a list's [`scroll_area`], the colours its accent scroll
+/// bar took, so the rows' own widgets keep the theme's.
+pub(super) fn plain_rows(ui: &mut egui::Ui) {
+    let global = ui.ctx().global_style();
+    let mut plain = global.visuals.clone();
+    let plain = widget_visuals(&mut plain).map(|widget| widget.fg_stroke.color);
+    for (widget, color) in widget_visuals(ui.visuals_mut()).into_iter().zip(plain) {
+        widget.fg_stroke.color = color;
+    }
+}
+
+/// [`egui::ScrollArea::show_rows`] with `inset` points of space above the
+/// first of its `total` rows.
+fn show_rows_under(
+    area: egui::ScrollArea,
+    ui: &mut egui::Ui,
+    row_height: f32,
+    total: usize,
+    inset: f32,
+    add_rows: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>),
+) -> egui::scroll_area::ScrollAreaOutput<()> {
+    let spacing = ui.spacing().item_spacing.y;
+    let step = row_height + spacing;
+    area.show_viewport(ui, |ui, viewport| {
+        ui.set_height((inset + step * total as f32 - spacing).max(0.0));
+        let mut first = ((viewport.min.y - inset) / step).floor().max(0.0) as usize;
+        let mut last = ((viewport.max.y - inset) / step).ceil().max(0.0) as usize + 1;
+        if last > total {
+            let shown = last - first;
+            last = total;
+            first = total.saturating_sub(shown);
+        }
+        let y_min = ui.max_rect().top() + inset + first as f32 * step;
+        let y_max = ui.max_rect().top() + inset + last as f32 * step;
+        let rect = Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |rows_ui| {
+            plain_rows(rows_ui);
+            rows_ui.skip_ahead_auto_ids(first);
+            add_rows(rows_ui, first..last);
+        });
+    })
+}
 
 /// What the list pane holds under its header: the chats, or on the Calls
 /// tab the call history or the new-call list.
@@ -693,9 +859,10 @@ fn starred_list(app: &mut App, ui: &mut egui::Ui) {
     // Rows read the list from the app while they hand their actions back, so
     // the actions are collected here and applied once the list is drawn.
     let mut actions = Vec::new();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
+    under_header(ui, |ui, inset| {
+        scroll_area(ui, inset).show(ui, |ui| {
+            plain_rows(ui);
+            ui.add_space(inset);
             for entry in &app.starred {
                 if app
                     .chat(&entry.message.chat)
@@ -714,6 +881,7 @@ fn starred_list(app: &mut App, ui: &mut egui::Ui) {
                 );
             }
         });
+    });
     app.actions.append(&mut actions);
 }
 
@@ -952,13 +1120,38 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
         widgets::empty_state(ui, &palette, Icon::MessageCircle, title, body);
         return;
     }
+    under_header(ui, |ui, inset| chat_rows(app, ui, &chats, to_top, inset));
+}
+
+/// The scrolling rows of `chats`, positions in `app.chats`, the first
+/// `inset` points of the scroll area lying under the frosted header.
+fn chat_rows(app: &mut App, ui: &mut egui::Ui, chats: &[usize], to_top: bool, inset: f32) {
     // Rows touch: one clickable surface from top to bottom, no gaps or rules.
     ui.spacing_mut().item_spacing.y = 0.0;
     let row_height = theme::ROW_HEIGHT;
     let total = chats.len();
-    let mut scroll_area = egui::ScrollArea::vertical()
-        .id_salt("chat-list")
-        .auto_shrink([false, false]);
+    let mut scroll_area = scroll_area(ui, inset).id_salt("chat-list");
+    // The copies a narrow window's slide draws have widget ids of their own:
+    // they show the real list's offset instead of keeping one.
+    let copy = ui
+        .ctx()
+        .data(|data| data.get_temp::<bool>(slide_copy_id()))
+        .is_some();
+    // Chats reordered by new messages keep the rows on screen where they
+    // were; a request below to go somewhere else wins.
+    let list_id = ui.make_persistent_id(egui::IdSalt::new("chat-list"));
+    let view = list_view(app);
+    let step = row_height + ui.spacing().item_spacing.y;
+    if !copy
+        && let Some(offset) = followed_offset(
+            ui,
+            list_id,
+            rows_moved(ui, list_id, view, &app.chats, chats),
+            step,
+        )
+    {
+        scroll_area = scroll_area.vertical_scroll_offset(offset);
+    }
     if to_top && near_top(ui, "chat-list", row_height) {
         scroll_area = scroll_area.vertical_scroll_offset(0.0);
     }
@@ -967,12 +1160,6 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
             .iter()
             .position(|&index| app.chats[index].id == *target)
     });
-    // The copies a narrow window's slide draws have widget ids of their own:
-    // they show the real list's offset instead of keeping one.
-    let copy = ui
-        .ctx()
-        .data(|data| data.get_temp::<bool>(slide_copy_id()))
-        .is_some();
     if copy
         && let Some(offset) = ui
             .ctx()
@@ -990,7 +1177,7 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
             .y;
         let offset = row_scroll_offset(
             current,
-            ui.available_height(),
+            ui.available_height() - inset,
             target_row,
             row_height,
             ui.spacing().item_spacing.y,
@@ -1004,11 +1191,21 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
     } else {
         0.0
     };
-    let output = scroll_area.show_rows(ui, row_height, total, |ui, range| {
+    let output = show_rows_under(scroll_area, ui, row_height, total, inset, |ui, range| {
         if carried != 0.0 {
             ui.scroll_with_delta_animation(
                 vec2(0.0, carried),
                 egui::style::ScrollAnimation::none(),
+            );
+        }
+        if !copy {
+            remember_rows(
+                ui,
+                list_id,
+                view,
+                &app.chats,
+                &chats[range.clone()],
+                range.start,
             );
         }
         for index in range {
@@ -1042,6 +1239,100 @@ fn list(app: &mut App, ui: &mut egui::Ui) {
         data.insert_temp(list_offset_id(), output.state.offset.y);
         data.insert_temp(list_offset_id().with("id"), output.id);
     });
+}
+
+/// The chats a list drew last frame, from the first on screen down, and the
+/// filter they were drawn under, so [`rows_moved`] can tell where they went.
+#[derive(Clone)]
+struct ShownRows {
+    view: egui::Id,
+    pass: u64,
+    first: usize,
+    ids: Vec<String>,
+}
+
+/// What the list under `view` shows: a change of filter or archive is a new
+/// list, not the old one moved.
+fn list_view(app: &App) -> egui::Id {
+    egui::Id::new((
+        std::mem::discriminant(&app.chat_filter),
+        &app.label_filter,
+        app.show_archived,
+        app.locked_folder_open(),
+    ))
+}
+
+/// How many rows the chats the list of scroll area `id` showed last frame
+/// moved since, so its offset can follow them: a message to a chat far
+/// down lifts it to the top, and every chat between moves a row down,
+/// which scrolled the list under the reader. The first pair of rows that
+/// still sit together says it; a chat that moved away from its neighbour
+/// is the one that jumped to the top. Nothing moved, or a list drawn under
+/// another filter, says zero.
+fn rows_moved(ui: &egui::Ui, id: egui::Id, view: egui::Id, all: &[Chat], chats: &[usize]) -> isize {
+    let Some(shown) = ui
+        .ctx()
+        .data(|data| data.get_temp::<ShownRows>(id.with("shown")))
+    else {
+        return 0;
+    };
+    let passes = ui.ctx().options(|options| options.max_passes.get()) as u64;
+    if shown.view != view || ui.ctx().cumulative_pass_nr() > shown.pass + passes {
+        return 0;
+    }
+    let same = shown.ids.iter().enumerate().all(|(n, id)| {
+        chats
+            .get(shown.first + n)
+            .and_then(|&index| all.get(index))
+            .is_some_and(|chat| chat.id == *id)
+    });
+    if same {
+        return 0;
+    }
+    let position = |id: &str| {
+        chats
+            .iter()
+            .position(|&index| all.get(index).is_some_and(|chat| chat.id == id))
+    };
+    for (n, pair) in shown.ids.windows(2).enumerate() {
+        if let (Some(at), Some(next)) = (position(&pair[0]), position(&pair[1]))
+            && next == at + 1
+        {
+            return at as isize - (shown.first + n) as isize;
+        }
+    }
+    0
+}
+
+/// Remembers the chats the list of scroll area `id` drew this frame.
+fn remember_rows(
+    ui: &egui::Ui,
+    id: egui::Id,
+    view: egui::Id,
+    all: &[Chat],
+    chats: &[usize],
+    first: usize,
+) {
+    let shown = ShownRows {
+        view,
+        pass: ui.ctx().cumulative_pass_nr(),
+        first,
+        ids: chats
+            .iter()
+            .filter_map(|&index| all.get(index))
+            .map(|chat| chat.id.clone())
+            .collect(),
+    };
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id.with("shown"), shown));
+}
+
+/// The offset that keeps the rows a scrolled list showed on screen when
+/// `moved` rows arrived above them (or left), or `None` at the top, where
+/// a chat lifted there by a new message shows up as it does on the phone.
+fn followed_offset(ui: &egui::Ui, id: egui::Id, moved: isize, step: f32) -> Option<f32> {
+    let offset = egui::scroll_area::State::load(ui.ctx(), id)?.offset.y;
+    (moved != 0 && offset > 0.5).then(|| (offset + moved as f32 * step).max(0.0))
 }
 
 /// Whether the list scrolled by `salt` is near enough its top to follow a sent
@@ -1129,38 +1420,45 @@ fn locked_list(app: &mut App, ui: &mut egui::Ui) {
         );
         return;
     }
-    ui.spacing_mut().item_spacing.y = 0.0;
-    let mut scroll_area = egui::ScrollArea::vertical()
-        .id_salt("locked-chats")
-        .auto_shrink([false, false]);
-    let target_row = app.scroll_chat_into_view.as_ref().and_then(|target| {
-        chats
-            .iter()
-            .position(|&index| app.chats[index].id == *target)
-    });
-    if let Some(target_row) = target_row {
-        let id = ui.make_persistent_id(egui::IdSalt::new("locked-chats"));
-        let current = egui::scroll_area::State::load(ui.ctx(), id)
-            .unwrap_or_default()
-            .offset
-            .y;
-        let offset = row_scroll_offset(
-            current,
-            ui.available_height(),
-            target_row,
-            theme::ROW_HEIGHT,
-            ui.spacing().item_spacing.y,
-        );
-        scroll_area = scroll_area.vertical_scroll_offset(offset);
-        app.scroll_chat_into_view = None;
-    }
-    scroll_area.show_rows(ui, theme::ROW_HEIGHT, chats.len(), |ui, range| {
-        for &index in &chats[range] {
-            let Some(chat) = app.chats.get(index).cloned() else {
-                continue;
-            };
-            ui.push_id(("chat", &chat.id), |ui| row(app, ui, &chat));
+    under_header(ui, |ui, inset| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut scroll_area = scroll_area(ui, inset).id_salt("locked-chats");
+        let target_row = app.scroll_chat_into_view.as_ref().and_then(|target| {
+            chats
+                .iter()
+                .position(|&index| app.chats[index].id == *target)
+        });
+        if let Some(target_row) = target_row {
+            let id = ui.make_persistent_id(egui::IdSalt::new("locked-chats"));
+            let current = egui::scroll_area::State::load(ui.ctx(), id)
+                .unwrap_or_default()
+                .offset
+                .y;
+            let offset = row_scroll_offset(
+                current,
+                ui.available_height() - inset,
+                target_row,
+                theme::ROW_HEIGHT,
+                ui.spacing().item_spacing.y,
+            );
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+            app.scroll_chat_into_view = None;
         }
+        show_rows_under(
+            scroll_area,
+            ui,
+            theme::ROW_HEIGHT,
+            chats.len(),
+            inset,
+            |ui, range| {
+                for &index in &chats[range] {
+                    let Some(chat) = app.chats.get(index).cloned() else {
+                        continue;
+                    };
+                    ui.push_id(("chat", &chat.id), |ui| row(app, ui, &chat));
+                }
+            },
+        );
     });
 }
 
@@ -1208,47 +1506,50 @@ fn results(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     ui.spacing_mut().item_spacing.y = 0.0;
-    egui::ScrollArea::vertical()
-        .id_salt("search-results")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            if !chats.is_empty() {
-                section(ui, &palette, "Chats");
-                for &index in &chats {
-                    let Some(chat) = app.chats.get(index).cloned() else {
-                        continue;
-                    };
-                    let reveal = ui.is_enabled()
-                        && app.scroll_chat_into_view.as_deref() == Some(chat.id.as_str());
-                    let response = ui
-                        .push_id(("chat", &chat.id), |ui| row(app, ui, &chat))
-                        .inner;
-                    if reveal {
-                        response.scroll_to_me(None);
-                        app.scroll_chat_into_view = None;
+    under_header(ui, |ui, inset| {
+        scroll_area(ui, inset)
+            .id_salt("search-results")
+            .show(ui, |ui| {
+                plain_rows(ui);
+                ui.add_space(inset);
+                if !chats.is_empty() {
+                    section(ui, &palette, "Chats");
+                    for &index in &chats {
+                        let Some(chat) = app.chats.get(index).cloned() else {
+                            continue;
+                        };
+                        let reveal = ui.is_enabled()
+                            && app.scroll_chat_into_view.as_deref() == Some(chat.id.as_str());
+                        let response = ui
+                            .push_id(("chat", &chat.id), |ui| row(app, ui, &chat))
+                            .inner;
+                        if reveal {
+                            response.scroll_to_me(None);
+                            app.scroll_chat_into_view = None;
+                        }
                     }
                 }
-            }
-            if hits > 0 {
-                section(ui, &palette, "Messages");
-                for index in 0..hits {
-                    let Some(hit) = app.search_hits.get(index).cloned() else {
-                        continue;
-                    };
-                    ui.push_id(("hit", &hit.chat, &hit.id), |ui| hit_row(app, ui, &hit));
+                if hits > 0 {
+                    section(ui, &palette, "Messages");
+                    for index in 0..hits {
+                        let Some(hit) = app.search_hits.get(index).cloned() else {
+                            continue;
+                        };
+                        ui.push_id(("hit", &hit.chat, &hit.id), |ui| hit_row(app, ui, &hit));
+                    }
                 }
-            }
-            if !contacts.is_empty() || offer_self {
-                section(ui, &palette, "Contacts");
-                if offer_self {
-                    ui.push_id("self", |ui| self_row(app, ui));
+                if !contacts.is_empty() || offer_self {
+                    section(ui, &palette, "Contacts");
+                    if offer_self {
+                        ui.push_id("self", |ui| self_row(app, ui));
+                    }
+                    for contact in &contacts {
+                        ui.push_id(("contact", &contact.id), |ui| contact_row(app, ui, contact));
+                    }
                 }
-                for contact in &contacts {
-                    ui.push_id(("contact", &contact.id), |ui| contact_row(app, ui, contact));
-                }
-            }
-            ui.add_space(8.0);
-        });
+                ui.add_space(8.0);
+            });
+    });
 }
 
 fn section(ui: &mut egui::Ui, palette: &Palette, label: &str) {
@@ -1911,6 +2212,18 @@ pub(super) fn compact_list(app: &mut App, ui: &mut egui::Ui) {
         .id_salt("chat-rail")
         .auto_shrink([false, false])
         .min_scrolled_height(0.0);
+    let rail_id = ui.make_persistent_id(egui::IdSalt::new("chat-rail"));
+    let view = list_view(app);
+    if !copy
+        && let Some(offset) = followed_offset(
+            ui,
+            rail_id,
+            rows_moved(ui, rail_id, view, &app.chats, &chats),
+            COMPACT_CELL + ui.spacing().item_spacing.y,
+        )
+    {
+        scroll_area = scroll_area.vertical_scroll_offset(offset);
+    }
     if to_top && near_top(ui, "chat-rail", COMPACT_CELL) {
         scroll_area = scroll_area.vertical_scroll_offset(0.0);
     }
@@ -1956,6 +2269,16 @@ pub(super) fn compact_list(app: &mut App, ui: &mut egui::Ui) {
     // Only the avatars on screen are laid out, however many chats there are.
     let output = scroll_area.show_rows(ui, COMPACT_CELL, chats.len(), |ui, range| {
         let mut focused = None;
+        if !copy {
+            remember_rows(
+                ui,
+                rail_id,
+                view,
+                &app.chats,
+                &chats[range.clone()],
+                range.start,
+            );
+        }
         if carried != 0.0 {
             ui.scroll_with_delta_animation(
                 vec2(0.0, carried),
@@ -2130,8 +2453,8 @@ fn compact_row(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> egui::Response 
     response
 }
 
-/// Centre of the unread badge on a collapsed avatar. A "99+" badge, the
-/// widest, still ends inside the rail.
+/// Centre of the unread badge on a collapsed avatar. Longer counts widen it
+/// to the left, so it still ends inside the rail.
 fn compact_badge_center(avatar: Rect) -> egui::Pos2 {
     pos2(avatar.right() - 10.0, avatar.top() + 2.0)
 }
@@ -2695,6 +3018,69 @@ mod tests {
     }
 
     #[test]
+    fn a_search_finds_a_name_with_letters_left_out_after_the_exact_matches() {
+        let (_directory, mut app, _ids, _ctx) = rail_app(0);
+        for (id, name, activity) in [
+            ("1@s.whatsapp.net", "John Smith", 1),
+            ("2@s.whatsapp.net", "Alice", 2),
+            ("3@s.whatsapp.net", "Jhn Doe", 0),
+        ] {
+            let mut chat = Chat::new(id.into(), name.into());
+            chat.last_activity = activity;
+            app.chats.push(chat);
+        }
+        app.search = "jhn".into();
+        let titles: Vec<String> = app
+            .visible_chats()
+            .into_iter()
+            .map(|chat| chat.name.clone())
+            .collect();
+        assert_eq!(titles, ["Jhn Doe", "John Smith"]);
+    }
+
+    #[test]
+    fn a_frosted_header_leaves_the_first_row_below_it_and_rows_scroll_under_it() {
+        let (_directory, mut app, ids, ctx) = rail_app(24);
+        app.palette.bubbles = crate::theme::BubbleStyle::Nothing;
+        let frame = |app: &mut App| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(360.0, 400.0))),
+                    ..Default::default()
+                },
+                |ui| column(app, ui),
+            );
+            output.textures_delta.clear();
+        };
+        frame(&mut app);
+        let header = ctx
+            .data(|data| data.get_temp::<Rect>(header_row_id()))
+            .expect("the header row was laid out");
+        let first = ctx
+            .data(|data| data.get_temp::<Rect>(chat_row_id(&ids[0])))
+            .expect("the first row was laid out");
+        // The search field and the chips lie between the title row and the
+        // list: the rows start under all of them, not under the title.
+        assert!(
+            (header.bottom() + 40.0..header.bottom() + 160.0).contains(&first.top()),
+            "first row at {}, header row ends at {}",
+            first.top(),
+            header.bottom()
+        );
+
+        // Scrolled down, rows keep being drawn up under the header: a row
+        // above where the first one rests can only have been laid out now.
+        app.scroll_chat_into_view = ids.last().cloned();
+        frame(&mut app);
+        frame(&mut app);
+        let under = ids.iter().any(|id| {
+            ctx.data(|data| data.get_temp::<Rect>(chat_row_id(id)))
+                .is_some_and(|row| row.top() < first.top() - 1.0 && row.bottom() > header.top())
+        });
+        assert!(under, "no row reached up under the header");
+    }
+
+    #[test]
     fn numbered_shortcuts_reveal_locked_chats_and_consume_the_scroll_request() {
         let (_directory, mut app, ids, ctx) = rail_app(24);
         for chat in &mut app.chats {
@@ -3145,11 +3531,12 @@ mod tests {
         let mut width = 0.0;
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let palette = Palette::dark();
-            width = widgets::badge(ui, &palette, compact_badge_center(avatar), 120, true);
+            width = widgets::badge(ui, &palette, compact_badge_center(avatar), 12_345, true);
         });
         output.textures_delta.clear();
         let center = compact_badge_center(avatar);
-        assert!(center.x + width / 2.0 <= rail.right(), "{width} too wide");
+        assert!(width > 20.0, "a long count widens the badge");
+        assert!(center.x + 10.0 <= rail.right(), "{width} too wide");
         assert!(center.y - 10.0 >= rail.top(), "the badge fits its cell");
     }
 }

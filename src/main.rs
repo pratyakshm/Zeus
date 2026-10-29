@@ -323,6 +323,7 @@ fn run() -> eframe::Result<()> {
     logging
         .init()
         .map_err(|error| eframe::Error::AppCreation(error.into()))?;
+    contain_panics();
     // Moving a single-account setup into its account folder needs the
     // keyring; when it cannot finish, the log says why.
     if !demo && let Err(error) = dirs.adopt_single_account() {
@@ -338,8 +339,7 @@ fn run() -> eframe::Result<()> {
     let settings = settings::Settings::load(&dirs.settings_file());
     // A Cargo build has no application bundle to supply its Dock icon.
     #[cfg(target_os = "macos")]
-    if let Err(error) = fastframe_dock::set_icon(include_bytes!("../packaging/macos/icon-1024.png"))
-    {
+    if let Err(error) = fastframe_dock::set_icon(DOCK_ICON) {
         log::warn!("could not set the Dock icon: {error}");
     }
     let demo_persistence = demo.then(|| dirs.state.join("window.ron"));
@@ -492,6 +492,38 @@ fn run() -> eframe::Result<()> {
         })?;
     drop(instance);
     Ok(())
+}
+
+/// Threads that catch their own panics. Each wraps its work in
+/// `catch_unwind` and turns a panic into an "unsupported file" result, so a
+/// malformed image or video cannot close the app. `video-sound` reads a
+/// video's sound track header off the UI thread (the mp4 hang fix), and
+/// `image-decode` decodes still pictures at their drawn size
+/// (`image_cache/loader.rs`).
+const CONTAINED_THREADS: &[&str] = &[
+    "animation-decode",
+    "image-decode",
+    "video-decode",
+    "video-sound",
+];
+
+/// Keeps release builds' old crash behavior for every thread but the
+/// decoders. The release profile unwinds so their guards work, but a panic
+/// anywhere else (the UI, the backend worker, a tokio task) must still end
+/// the process instead of quietly leaving a dead thread behind. Chains the
+/// panic log hook, so the panic is recorded first.
+fn contain_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        if !is_contained(std::thread::current().name()) {
+            std::process::abort();
+        }
+    }));
+}
+
+fn is_contained(thread: Option<&str>) -> bool {
+    thread.is_some_and(|name| CONTAINED_THREADS.contains(&name))
 }
 
 /// Whether eframe stopped because the graphics driver gave it no usable
@@ -740,19 +772,31 @@ impl eframe::App for Shell {
         }
     }
 
-    #[cfg(feature = "demo")]
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        if let Some(tour) = &mut self.tour {
-            tour.input(&mut self.app, ctx, input);
-        }
-        // Moves the pointer only while it is elsewhere: each move restarts
-        // egui's tooltip delay, so a fake pointer that kept moving in place
-        // would never show one.
-        if let Some(pos) = self.hover
-            && ctx.input(|input| input.pointer.latest_pos()) != Some(pos)
+        // A maximized Windows window hides its sizing frame, which leaves the
+        // interface that much closer to a shorter title bar: start it lower.
+        let inset = zeus::window_inset::top(input);
+        if inset > 0.0
+            && let Some(screen) = &mut input.screen_rect
         {
-            input.events.push(egui::Event::PointerMoved(pos));
+            screen.min.y = (screen.min.y + inset).min(screen.max.y);
         }
+        #[cfg(feature = "demo")]
+        {
+            if let Some(tour) = &mut self.tour {
+                tour.input(&mut self.app, ctx, input);
+            }
+            // Moves the pointer only while it is elsewhere: each move restarts
+            // egui's tooltip delay, so a fake pointer that kept moving in place
+            // would never show one.
+            if let Some(pos) = self.hover
+                && ctx.input(|input| input.pointer.latest_pos()) != Some(pos)
+            {
+                input.events.push(egui::Event::PointerMoved(pos));
+            }
+        }
+        #[cfg(not(feature = "demo"))]
+        let _ = ctx;
     }
 
     /// Does not persist egui interaction state across windows. The zoom and
@@ -1092,6 +1136,63 @@ mod tests {
             ])
             .is_err()
         );
+    }
+}
+
+/// The unbundled Dock icon: 512 pixels at 144 dpi, so 256 points, which
+/// covers the Dock fully magnified on a Retina screen. AppKit keeps a
+/// snapshot of the icon at its size in points times the screen's scale, and
+/// the 1024-pixel PNG at 72 dpi held one of 32 MB for the whole session.
+#[cfg(any(target_os = "macos", test))]
+const DOCK_ICON: &[u8] = include_bytes!("../packaging/macos/icon-dock.png");
+
+#[cfg(test)]
+mod dock_icon_tests {
+    use super::DOCK_ICON;
+
+    /// The big-endian `u32` at `at`.
+    fn word(at: usize) -> u32 {
+        u32::from_be_bytes(DOCK_ICON[at..at + 4].try_into().unwrap())
+    }
+
+    /// The icon stays small in points: a larger image or a lower density
+    /// brings back a snapshot several times the size.
+    #[test]
+    fn dock_icon_is_256_points() {
+        assert_eq!(&DOCK_ICON[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&DOCK_ICON[12..16], b"IHDR");
+        assert_eq!((word(16), word(20)), (512, 512));
+        let physical = DOCK_ICON
+            .windows(4)
+            .position(|chunk| chunk == b"pHYs")
+            .expect("the icon states its density");
+        // 144 dpi in pixels per metre, the unit PNG uses.
+        assert_eq!(word(physical + 4), 5669);
+        assert_eq!(word(physical + 8), 5669);
+        assert_eq!(DOCK_ICON[physical + 12], 1, "the unit is the metre");
+    }
+}
+
+#[cfg(test)]
+mod panic_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_decoder_threads_survive_a_panic() {
+        assert!(is_contained(Some("animation-decode")));
+        assert!(is_contained(Some("image-decode")));
+        assert!(is_contained(Some("video-decode")));
+        assert!(is_contained(Some("video-sound")));
+        assert!(!is_contained(Some("main")));
+        assert!(!is_contained(Some("tokio-runtime-worker")));
+        assert!(!is_contained(None));
+    }
+
+    #[test]
+    fn the_contained_names_match_the_decoder_threads() {
+        // A renamed thread would silently lose its guard.
+        assert!(include_str!("animation.rs").contains(r#".name("animation-decode".into())"#));
+        assert!(include_str!("video.rs").contains(r#".name("video-decode".into())"#));
     }
 }
 

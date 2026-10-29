@@ -379,13 +379,18 @@ pub fn paint_avatar(
     if !painted {
         let fill = palette.avatar(crate::util::hue(id));
         ui.painter().circle_filled(rect.center(), size / 2.0, fill);
+        let initials = crate::util::initials(name);
         if crate::model::ChatKind::from_id(id) == crate::model::ChatKind::Group {
             theme::paint_icon(ui, Icon::Users, rect, size * 0.5, Color32::WHITE);
+        } else if initials.is_empty() {
+            // A name with no letters, as an unsaved contact's number: a
+            // person, not its digits.
+            theme::paint_icon(ui, Icon::User, rect, size * 0.5, Color32::WHITE);
         } else {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                crate::util::initials(name),
+                initials,
                 theme::semibold(size * 0.38),
                 Color32::WHITE,
             );
@@ -435,18 +440,18 @@ pub fn tick_icon(status: Delivery) -> Option<Icon> {
     })
 }
 
-/// Chat-row unread badge.
+/// Chat-row unread badge, showing the whole count. `at` is the centre of a
+/// one-digit round; a longer count widens the pill to the left from there,
+/// so it keeps its right edge where the round's is.
 pub fn badge(ui: &Ui, palette: &Palette, at: egui::Pos2, count: u32, muted: bool) -> f32 {
-    let label = if count > 99 {
-        "99+".to_owned()
-    } else {
-        count.to_string()
-    };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label, theme::semibold(11.0), palette.on_accent);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(count.to_string(), theme::semibold(11.0), palette.on_accent);
     let width = (galley.size().x + 12.0).max(20.0);
-    let rect = Rect::from_center_size(at, vec2(width, 20.0));
+    let rect = Rect::from_min_max(
+        pos2(at.x + 10.0 - width, at.y - 10.0),
+        pos2(at.x + 10.0, at.y + 10.0),
+    );
     let fill = if muted { palette.dim } else { palette.accent };
     ui.painter().rect_filled(rect, 10.0, fill);
     ui.painter().galley(
@@ -829,39 +834,41 @@ impl FrostedPopup for egui::Popup<'_> {
             egui::LayerId::new(egui::Order::Foreground, id),
             theme::RADIUS_MENU,
         );
-        // Animated only while open. A closed popup that asked would start the
-        // opening, and with it a frame, on every frame, and its reset below
-        // would take it back each time, so the window never went idle.
-        let shown = self.show(|ui| {
-            let appear = ctx.animate_bool_with_time_and_easing(
+        // Only an open popup runs its animation: a closed one asking for it
+        // each frame would start it anew and keep the window repainting.
+        let appear = if self.is_open() {
+            ctx.animate_bool_with_time_and_easing(
                 id.with("appear"),
                 true,
-                theme::POPUP_OPEN,
-                egui::emath::easing::quadratic_out,
-            );
+                theme::MOTION_QUICK,
+                theme::ease_out,
+            )
+        } else {
+            0.0
+        };
+        let shown = self.show(|ui| {
             ui.multiply_opacity(appear);
-            (appear, add(ui))
+            add(ui)
         });
-        let Some(egui::InnerResponse {
-            inner: (appear, inner),
-            response,
-        }) = shown
-        else {
+        let Some(shown) = shown else {
             // Closed: the next opening starts from the beginning.
             ctx.animate_bool_with_time(id.with("appear"), false, 0.0);
             return None;
         };
         if measured {
-            frost.place(response.rect);
-            // Grows from the corner it opened at, glass and all.
+            frost.place(shown.response.rect);
+            // Grows from the corner it opened at, glass and all, and
+            // shrinks back to it as it closes.
             let scale = POPUP_FROM_SCALE + (1.0 - POPUP_FROM_SCALE) * appear;
-            let pivot = response.rect.left_top().to_vec2();
+            let pivot = shown.response.rect.left_top();
+            let layer = egui::LayerId::new(egui::Order::Foreground, id);
             ctx.transform_layer_shapes(
-                egui::LayerId::new(egui::Order::Foreground, id),
-                egui::emath::TSTransform::new(pivot * (1.0 - scale), scale),
+                layer,
+                egui::emath::TSTransform::new(pivot.to_vec2() * (1.0 - scale), scale),
             );
+            super::closing::keep(ctx, layer, pivot, theme::MOTION_QUICK, appear);
         }
-        Some(egui::InnerResponse::new(inner, response))
+        Some(shown)
     }
 }
 
@@ -923,6 +930,9 @@ pub fn cap_middle(galley: &egui::Galley) -> Option<f32> {
 pub fn search_galley_id(field: egui::Id) -> egui::Id {
     field.with("galley")
 }
+
+/// How strongly a search field's focus ring shows, as a tint of the text colour.
+const SEARCH_RING: f32 = 0.28;
 
 /// Search field with icon and clear button.
 pub fn search_field(
@@ -1009,7 +1019,15 @@ pub fn search_field(
         );
     });
     let response = output.response.response;
-    theme::focus_outline(ui, response.id, rect, height / 2.0);
+    // A quiet grey ring, a tint of the text colour: a search field is
+    // always at hand, and the accent there is loud.
+    theme::focus_outline_colored(
+        ui,
+        response.id,
+        rect,
+        height / 2.0,
+        palette.tint(SEARCH_RING),
+    );
     ui.ctx()
         .accesskit_node_builder(response.id, |node| node.set_label(hint));
     if !text.is_empty() {
@@ -1053,7 +1071,7 @@ pub fn switch(ui: &mut Ui, palette: &Palette, on: &mut bool) -> egui::Response {
         response.mark_changed();
     }
     if ui.is_rect_visible(rect) {
-        let t = ui.ctx().animate_bool(response.id, *on);
+        let t = theme::animate(ui.ctx(), response.id, *on, theme::MOTION_QUICK);
         let fill = egui::lerp(
             egui::Rgba::from(palette.surface_active)..=egui::Rgba::from(palette.accent),
             t,
@@ -1118,10 +1136,11 @@ pub fn glass_slider(
     }
     if ui.is_rect_visible(rect) {
         let t = ((*value - start) / (end - start)).clamp(0.0, 1.0);
-        let active = ui.ctx().animate_bool_with_time(
+        let active = theme::animate(
+            ui.ctx(),
             response.id,
             response.hovered() || response.dragged(),
-            0.15,
+            theme::MOTION_QUICK,
         );
         let painter = ui.painter();
         let x = egui::lerp(travel.clone(), t);
