@@ -2442,6 +2442,11 @@ struct View<'a> {
     /// them, when there are any: each bubble lays a soft scrim over them
     /// (#29).
     doodles: Option<(f32, Color32)>,
+    /// Where the transcript collects its bubbles' scrims, to lay them all
+    /// under the first bubble once the rows are drawn: each is painted after
+    /// the bubble above it, and would otherwise veil that bubble's lower
+    /// edge and text. A row drawn alone paints its scrim in place.
+    scrims: Option<&'a std::cell::RefCell<Vec<(egui::LayerId, egui::layers::ShapeIdx)>>>,
 }
 
 /// Protocol album parent carried by pictures and ordinary videos.
@@ -2932,6 +2937,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
     let names_or = |id: &str, hint: Option<&str>| app.display_name_or(id, hint);
     let mention_names = |id: &str| app.mention_name(id);
     let keyboard_navigation = std::cell::Cell::new(false);
+    let scrims = std::cell::RefCell::new(Vec::new());
     let view = View {
         palette,
         locale: app.locale,
@@ -2993,6 +2999,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
             .then_some(app.copy_rows.as_ref()),
         swipes: app.settings.swipes,
         doodles: app.doodles_behind(),
+        scrims: Some(&scrims),
     };
     let mut actions = Vec::new();
     let mut anchored = false;
@@ -3150,6 +3157,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
     // rows put the plain colours back for their own widgets.
     let accent = ui.visuals().selection.stroke.color;
     let plain = handle_colors(ui.visuals_mut()).map(|color| std::mem::replace(color, accent));
+    let mut scrim_slot = None;
     let output = egui::ScrollArea::vertical()
         .id_salt(("messages", &chat.id))
         .scroll_bar_rect(bar_rect)
@@ -3165,6 +3173,8 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
             for (color, plain) in handle_colors(ui.visuals_mut()).into_iter().zip(plain) {
                 *color = plain;
             }
+            // Under every row: the bubbles' scrims gather here at the end.
+            scrim_slot = Some(ui.painter().add(egui::Shape::Noop));
             // Scroll while selecting near an edge. `scroll_with_delta` also
             // releases stick-to-bottom; setting the offset directly does not.
             let viewport = ui.clip_rect();
@@ -3843,6 +3853,10 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32, over: f32
     for (color, plain) in handle_colors(ui.visuals_mut()).into_iter().zip(plain) {
         *color = plain;
     }
+    // Before the glide, which slides the slot with the rows.
+    if let Some(slot) = scrim_slot {
+        lay_scrims_under(ui.ctx(), layer, slot, &scrims.borrow());
+    }
     glide_new_message(ui, &chat.id, newest, &output, layer, first_shape);
     app.scroll_route
         .place(crate::app::ScrollPane::Messages, output.inner_rect);
@@ -4480,6 +4494,29 @@ pub(crate) fn flying_to(ctx: &egui::Context) -> Option<String> {
 
 /// How far a bubble's scrim reaches past its edge, and fades over.
 const SCRIM_REACH: f32 = 24.0;
+
+/// Moves the bubbles' scrims at `scrims` into `slot`, which was reserved
+/// before the first row, so each wash lies under every bubble instead of
+/// over the bottom of the one above it. Arrival and send animations have
+/// already moved or faded each scrim with its bubble by now, and a scrim
+/// lifted onto another layer left an empty shape behind.
+fn lay_scrims_under(
+    ctx: &egui::Context,
+    layer: egui::LayerId,
+    slot: egui::layers::ShapeIdx,
+    scrims: &[(egui::LayerId, egui::layers::ShapeIdx)],
+) {
+    ctx.graphics_mut(|graphics| {
+        let list = graphics.entry(layer);
+        let mut shapes = Vec::new();
+        for &(_, index) in scrims.iter().filter(|(on, _)| *on == layer) {
+            list.mutate_shape(index, |clipped| {
+                shapes.push(std::mem::replace(&mut clipped.shape, egui::Shape::Noop));
+            });
+        }
+        list.mutate_shape(slot, |clipped| clipped.shape = egui::Shape::Vec(shapes));
+    });
+}
 
 /// A soft, wide wash behind a bubble, so doodles fade out before they reach
 /// its text at any intensity (#29): the wallpaper's colour leaning towards
@@ -6053,6 +6090,9 @@ fn bubble_frame(
     if fill != Color32::TRANSPARENT && ui.is_rect_visible(inner.response.rect) {
         if let Some(shape) = doodle_scrim(inner.response.rect, fill, view.doodles) {
             ui.painter().set(scrim, shape);
+            if let Some(scrims) = view.scrims {
+                scrims.borrow_mut().push((ui.layer_id(), scrim));
+            }
         }
         ui.painter().set(
             backdrop,
@@ -7578,6 +7618,7 @@ pub(crate) fn list_menu(
         copy_rows: Some(app.copy_rows.as_ref()),
         swipes: app.settings.swipes,
         doodles: app.doodles_behind(),
+        scrims: None,
         selecting: false,
         selected: &[],
         motion_playing: None,
@@ -13630,6 +13671,7 @@ mod tests {
             copy_rows: Some(app.copy_rows.as_ref()),
             swipes: app.settings.swipes,
             doodles: None,
+            scrims: None,
             selecting: false,
             selected: &[],
             motion_playing: None,
@@ -13765,6 +13807,47 @@ mod tests {
         assert!(!auto_download_allowed(&sticker, false, false));
         sticker.size = crate::model::ATTACHMENT_DOWNLOAD_LIMIT + 1;
         assert!(!auto_download_allowed(&sticker, true, false));
+    }
+
+    /// Every bubble's scrim ends up under every bubble: the second bubble's
+    /// wash, painted after the first bubble, no longer veils its bottom.
+    #[test]
+    fn scrims_lie_under_every_bubble() {
+        let ctx = egui::Context::default();
+        let first = Rect::from_min_size(pos2(20.0, 20.0), vec2(160.0, 34.0));
+        let second = first.translate(vec2(0.0, 38.0));
+        let fill = Color32::from_rgb(0xd9, 0xfd, 0xd3);
+        let wall = Color32::from_rgb(0xef, 0xea, 0xe2);
+        let scrims = std::cell::RefCell::new(Vec::new());
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let slot = ui.painter().add(egui::Shape::Noop);
+            for bubble in [first, second] {
+                let scrim = ui.painter().add(egui::Shape::Noop);
+                ui.painter().rect_filled(bubble, 8.0, fill);
+                let shape = doodle_scrim(bubble, fill, Some((1.0, wall))).expect("a scrim");
+                ui.painter().set(scrim, shape);
+                scrims.borrow_mut().push((ui.layer_id(), scrim));
+            }
+            lay_scrims_under(ui.ctx(), ui.layer_id(), slot, &scrims.borrow());
+        });
+        output.textures_delta.clear();
+        // In paint order: true for a scrim, false for a bubble.
+        let mut order = Vec::new();
+        let mut pending: Vec<&egui::Shape> = output
+            .shapes
+            .iter()
+            .rev()
+            .map(|clipped| &clipped.shape)
+            .collect();
+        while let Some(shape) = pending.pop() {
+            match shape {
+                egui::Shape::Vec(shapes) => pending.extend(shapes.iter().rev()),
+                egui::Shape::Rect(rect) if rect.blur_width > 0.0 => order.push(true),
+                egui::Shape::Rect(rect) if rect.fill == fill => order.push(false),
+                _ => {}
+            }
+        }
+        assert_eq!(order, [true, true, false, false]);
     }
 
     /// The typing dots animate at the display's rate, not a fixed timer.
