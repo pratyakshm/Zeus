@@ -5784,7 +5784,7 @@ fn reference_timestamp(
                         Delivery::Sent | Delivery::Delivered | Delivery::Read | Delivery::Played
                     ) {
                         let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-                        tick_motion(ui, view, message, ticks, rect);
+                        tick_motion(ui, view, message, ticks, rect, view.palette.secondary);
                     }
                 }
             }
@@ -5815,9 +5815,17 @@ fn status_advanced(previous: Option<Delivery>, now: Delivery) -> bool {
     matches!(previous, Some(before) if before != now) && now != Delivery::Failed
 }
 
-/// Draws the delivery ticks. A live advance scales the new glyph in about its
-/// centre with a fade, and a change to read blends the colour.
-fn tick_motion(ui: &mut egui::Ui, view: &View<'_>, message: &Message, shown: Delivery, rect: Rect) {
+/// Draws the delivery ticks, in `plain` for the states that are not read or
+/// failed. A live advance scales the new glyph in about its centre with a
+/// fade, and a change to read blends the colour.
+fn tick_motion(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    shown: Delivery,
+    rect: Rect,
+    plain: Color32,
+) {
     let now = ui.input(|input| input.time);
     let status_id = egui::Id::new(("tick-status", &view.chat.id, &message.id));
     let motion_id = egui::Id::new(("tick-motion", &view.chat.id, &message.id));
@@ -5840,7 +5848,7 @@ fn tick_motion(ui: &mut egui::Ui, view: &View<'_>, message: &Message, shown: Del
     let motion: Option<(f64, Delivery)> = ui.ctx().data(|data| data.get_temp(motion_id));
     let live = motion.filter(|(start, _)| now - start < TICK_SECONDS && !calm);
     let Some((start, before)) = live else {
-        widgets::ticks(ui, &view.palette, rect, shown);
+        widgets::ticks_in(ui, &view.palette, rect, shown, plain);
         return;
     };
     let t = theme::ease_out(((now - start) / TICK_SECONDS) as f32);
@@ -5862,14 +5870,14 @@ fn tick_motion(ui: &mut egui::Ui, view: &View<'_>, message: &Message, shown: Del
         let palette = &view.palette;
         let colour = |status: Delivery| match status {
             Delivery::Read | Delivery::Played => palette.read,
-            _ => palette.secondary,
+            _ => plain,
         };
         let blended = colour(before).lerp_to_gamma(colour(shown), t);
         widgets::ticks_in(ui, palette, rect, Delivery::Sent, blended);
     } else {
         let old_opacity = ui.opacity();
         ui.multiply_opacity(t);
-        widgets::ticks(ui, &view.palette, rect, shown);
+        widgets::ticks_in(ui, &view.palette, rect, shown, plain);
         ui.set_opacity(old_opacity);
         let scale = 0.7 + 0.3 * t;
         let pivot = rect.center();
@@ -7778,7 +7786,6 @@ fn footer_over_picture(
     pinned: bool,
     actions: &mut Vec<Action>,
 ) {
-    let palette = &view.palette;
     let font = theme::regular(11.0);
     let time =
         ui.painter()
@@ -7822,11 +7829,13 @@ fn footer_over_picture(
     let mut x = row.right();
     if message.from_me {
         let ticks = Rect::from_center_size(pos2(x - 7.5, row.center().y), Vec2::splat(15.0));
-        widgets::ticks_in(
+        // Pops as the status advances, like the ticks under a bubble's text.
+        tick_motion(
             ui,
-            palette,
-            ticks,
+            view,
+            message,
             shown_delivery(view, message),
+            ticks,
             Color32::WHITE,
         );
         x -= tick_width;
@@ -7991,7 +8000,14 @@ fn footer(
     let mut x = rect.right();
     if message.from_me {
         let ticks = Rect::from_center_size(pos2(x - 7.5, rect.center().y), Vec2::splat(15.0));
-        tick_motion(ui, view, message, shown_delivery(view, message), ticks);
+        tick_motion(
+            ui,
+            view,
+            message,
+            shown_delivery(view, message),
+            ticks,
+            view.palette.secondary,
+        );
         x -= tick_width;
     }
     x -= time.size().x;
